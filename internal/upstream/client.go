@@ -339,10 +339,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			continue
 		}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
+			ID:             m.ID,
+			Name:           m.Name,
+			ContextWindow:  m.MaxInputTokens,
+			ContextFromAPI: true, // 目录接口真实返回
+			MaxTokens:      m.MaxOutputTokens,
 		})
 	}
 	if len(out) == 0 {
@@ -461,7 +462,9 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 		default:
 			total_, used, remain = acct.CapacitySize, acct.CapacityUsed, acct.CapacityRemain
 		}
-		if remain < 0 { remain = 0 }
+		if remain < 0 {
+			remain = 0
+		}
 		total += remain
 		items = append(items, provider.ResourceItem{
 			Name:   acct.PackageName,
@@ -528,9 +531,9 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 		Code int `json:"code"`
 		Data struct {
 			Models []struct {
-				ID      string `json:"id"`
-				Name    string `json:"name"`
-				Credits string `json:"credits"` // "x0.79 credits"
+				ID      string   `json:"id"`
+				Name    string   `json:"name"`
+				Credits string   `json:"credits"` // "x0.79 credits"
 				Tags    []string `json:"tags"`
 			} `json:"models"`
 		} `json:"data"`
@@ -552,20 +555,19 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 			continue
 		}
 		rate := parseCredits(m.Credits)
-		note := ""
-		for _, tag := range m.Tags {
-			if strings.HasPrefix(tag, "badge:") {
-				note = strings.TrimPrefix(tag, "badge:")
-			}
-		}
-		if note == "" && rate == 0 && m.ID != "auto" {
-			note = "限时免费"
-		}
+		// 上游 parseBadge 解析 "badge:<文案>:<#颜色>"，颜色单独走 Color 字段。
+		note, color := parseBadge(m.Tags)
+		// 保留「限免模型」后，靠 Explicit 区分两种 0：
+		//   限免模型（x0.00，credits 非空）→ Explicit=true, Rate=0 → 面板高亮 Free
+		//   auto 等无倍率字段模型        → Explicit=false      → 面板显示 unknown
+		explicit := strings.TrimSpace(m.Credits) != ""
 		out = append(out, provider.ModelPricing{
-			Model:   m.ID,
-			Channel: "workbuddy",
-			Rate:    rate,
-			Note:    note,
+			Model:    m.ID,
+			Channel:  "workbuddy",
+			Rate:     rate,
+			Note:     note,
+			Color:    color,
+			Explicit: &explicit,
 		})
 	}
 	if len(out) == 0 {
@@ -587,6 +589,29 @@ func parseCredits(s string) float64 {
 	var v float64
 	fmt.Sscanf(s, "%f", &v)
 	return v
+}
+
+// parseBadge 从上流 tags 中提取促销标签与颜色。
+// 上流格式为 "badge:<文案>:<#颜色>"（如 "badge:独家优惠:#FF0000"），
+// 颜色部分必须剥离，否则会原样显示在 UI 上。
+// 兼容无颜色后缀（"badge:限时免费"）的情形。
+func parseBadge(tags []string) (label, color string) {
+	const prefix = "badge:"
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, prefix) {
+			continue
+		}
+		body := strings.TrimPrefix(tag, prefix)
+		// 颜色取最后一个 ':' 之后的 #RRGGBB/#RGB；无则视为纯文案
+		if i := strings.LastIndex(body, ":"); i >= 0 {
+			c := strings.TrimSpace(body[i+1:])
+			if strings.HasPrefix(c, "#") && len(c) >= 4 && len(c) <= 9 {
+				return strings.TrimSpace(body[:i]), c
+			}
+		}
+		return strings.TrimSpace(body), ""
+	}
+	return "", ""
 }
 
 func truncate(s string, n int) string {

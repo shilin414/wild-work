@@ -9,6 +9,9 @@ auths/
 config.json
 *.log
 
+# 参考项目（第三方克隆，不纳入版本控制）
+ref/
+
 # 临时文件
 temp/
 

@@ -27,6 +27,12 @@ type Config struct {
 	CheckinMinutes []int  // 当天分钟数，优先于 CheckinHours
 	KeepaliveHours []int  // 默认 [22]
 	SkipCheckin    bool   // 渠道无签到活动（qoder）：不排签到，避免刷失败日志
+
+	// ActivitiesOnly 表示本渠道无签到活动：定时仍调用 Upstream.DailyCheckin
+	// （用于账号活跃保活），但不记录、不上报签到状态，保持对用户透明。
+	// WorkBuddy 国际版使用该模式。与 SkipCheckin 的区别：SkipCheckin 完全不跑签到，
+	// ActivitiesOnly 照跑 DailyCheckin（用作保活）但不上报状态。
+	ActivitiesOnly bool
 }
 
 // Scheduler 调度器。
@@ -282,6 +288,16 @@ func (s *Scheduler) CheckinAccount(uid string) (CheckinResult, error) {
 	return s.checkinOne(uid), nil
 }
 
+// finishCheckin 统一收尾：记录签到状态并上报观察者。
+// ActivitiesOnly 渠道跳过这两步（无签到语义，且需对用户透明）。
+func (s *Scheduler) finishCheckin(uid string, r CheckinResult) CheckinResult {
+	if !s.cfg.ActivitiesOnly {
+		s.cfg.Pool.RecordCheckin(uid, r.OK, r.Msg)
+		s.notifyCheckin(r)
+	}
+	return r
+}
+
 // checkinOne 单账号签到 + 余额刷新 + 解冻 + 记录签到状态。
 func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	name := s.name()
@@ -292,18 +308,12 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	}
 	a := s.cfg.Pool.AuthByUID(uid)
 	if a == nil || a.RefreshToken == "" {
-		r := CheckinResult{UID: uid, Nickname: nickname, Msg: "no refresh token"}
-		s.cfg.Pool.RecordCheckin(uid, false, r.Msg)
-		s.notifyCheckin(r)
-		return r
+		return s.finishCheckin(uid, CheckinResult{UID: uid, Nickname: nickname, Msg: "no refresh token"})
 	}
 	// 签到前保证 access token 有效；否则仅依赖晚间 keepalive 时，早上的签到可能拿过期 token。
 	if a.NeedsRefresh(2 * time.Hour) {
 		if err := s.refreshForCheckin(a, uid); err != nil {
-			r := CheckinResult{UID: uid, Nickname: nickname, Msg: "refresh: " + shortErr(err)}
-			s.cfg.Pool.RecordCheckin(uid, false, r.Msg)
-			s.notifyCheckin(r)
-			return r
+			return s.finishCheckin(uid, CheckinResult{UID: uid, Nickname: nickname, Msg: "refresh: " + shortErr(err)})
 		}
 	}
 	r := CheckinResult{UID: uid, Nickname: nickname}
@@ -327,6 +337,11 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	} else {
 		r.OK = true
 		r.Msg = "ok"
+		// 无签到活动渠道：DailyCheckin 实为活跃保活，用准确的文案记录日志，
+		// 避免日志中把保活误读为签到。
+		if s.cfg.ActivitiesOnly {
+			r.Msg = "活跃保活"
+		}
 	}
 	// 无论签到成败都查余额（已签到等业务错误下余额刷新仍有效）
 	remain, rerr := s.cfg.Upstream.UserResource(a)
@@ -343,9 +358,7 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 		log.Printf("checkin credits platform=%s uid=%s remain=%d", name, uid, remain)
 		s.cfg.Pool.ReenableIfCredits(uid, remain)
 	}
-	s.cfg.Pool.RecordCheckin(uid, r.OK, r.Msg)
-	s.notifyCheckin(r)
-	return r
+	return s.finishCheckin(uid, r)
 }
 
 // isAlready 只匹配明确的“今日已签到”，不能因错误文本包含 checkin 就判成功。

@@ -8,12 +8,13 @@
 
 ## 0. 项目渊源
 
-Wild-Work 是 WorkBuddy/TraeWork/Qoder 三渠道账号聚合工具，演进历程：
+Wild-Work 是 WorkBuddy（国内版+国际版）/TraeWork/Qoder 多渠道账号聚合工具，演进历程：
 
 1. **上游 API 仓库**：3 个独立仓库 (`wild-work-buddy-api`, `wild-work-traework-api`, `wild-work-qoder-api`) → 提供各渠道基础 API 封装
 2. **v0.1.x (workbuddy-wild)**：Wails GUI 包装器，仅支持 WorkBuddy 单渠道
 3. **v0.2.x**：增加 TraeWork 集成，仍用 Wails
 4. **v2.0.x (当前 master)**：大改版弃用 Wails，改用**系统托盘 daemon + 浏览器 Web UI**；新增 Qoder 渠道
+5. **v2.1.x**：新增 **WorkBuddy 国际版**（`www.workbuddy.ai`）渠道，与国内版 `workbuddy` 完全独立
 
 > ⚠️ v0.2.x 代码已迁移至 `legacy-wails` 分支，不再维护。
 
@@ -34,7 +35,7 @@ Wild-Work 是 WorkBuddy/TraeWork/Qoder 三渠道账号聚合工具，演进历�
 | R7 | **移除 wails / WebView2 全部依赖** | 省内存与运行时；平台能力封装进 `internal/platform`（build tag 拆分） |
 | R8 | daemon 单进程：一个 `http.Server` 同时服务 OpenAI 端点 + 管理 API + 静态 UI | 沿用 server 现有 ServeMux 扩展 |
 | R9 | 核心业务（pool/scheduler/upstream/traework/server/login/config/auth/provider）**整体复用**，格式零迁移 | config.json / auths/ / data/state.json 兼容旧版；旧 state.json 自动迁移到 state-workbuddy.json |
-| R10 | 新增渠道扩展方式：实现 `provider.Upstream` 接口 + auth 加载器 + 注册 Runtime | 模型前缀 `channel/<model>` 路由；已实现 WorkBuddy + TraeWork + Qoder 三渠道 |
+| R10 | 新增渠道扩展方式：实现 `provider.Upstream` 接口 + auth 加载器 + 注册 Runtime | 模型前缀 `channel/<model>` 路由；已实现 WorkBuddy(国内) + WorkBuddyAI(国际) + TraeWork + Qoder 四渠道 |
 | R11 | Windows 产物在 WSL 交叉编译（`GOOS=windows CGO_ENABLED=0`，已验证可行）；macOS 产物走 GitHub Actions macos-latest（cgo 必需） | WSL 无法编 darwin cgo；CI 增加 darwin job |
 | R12 | **无桌面 Linux 使用 `--no-tray` 参数** | 无参启动在无 DBus 环境托盘 panic 直接 exit 并提示；`--no-tray` 跳过托盘打印信息阻塞等待 Ctrl+C |
 
@@ -72,7 +73,7 @@ wild-work
 | 顶部栏 | 品牌名/版本号、API 地址（点击弹窗配置）、API-Key（点击弹窗修改）、帮助/关于 |
 | 账号管理 | 双列卡片网格，账号名/UID/积分/签到状态，图标按钮操作（签到/刷新/停用/删除） |
 | 自动签到 | 签到时间（HH:MM 多组）+ 开机自启开关（左右布局） |
-| 渠道费率 | 三渠道模型定价表（按渠道分组，合并单元格），刷新按钮 |
+| 渠道费率 | 四渠道模型定价表（按渠道分组，合并单元格），刷新按钮 |
 
 管理 API（REST，均挂 `/api/*`）：
 
@@ -97,7 +98,7 @@ GET  /api/logs                     # 最近 300 行日志
 POST /api/quit                     # 退出程序
 ```
 
-## 5. 渠道（已实现 WorkBuddy + TraeWork + Qoder）
+## 5. 渠道（已实现 WorkBuddy 国内版 + WorkBuddyAI 国际版 + TraeWork + Qoder）
 
 1. 新建 `internal/<channel>/` 包，实现 `provider.Upstream` 接口
 2. `internal/auth` 增加对应 `Load<Channel>Dir()`（文件名前缀 `<channel>-*.json`）
@@ -106,9 +107,15 @@ POST /api/quit                     # 退出程序
 
 > provider.Kind 即模型名前缀；server 按 `channel/<model>` 前缀路由，无需改接口。
 > Qoder 渠道无签到活动：`DailyCheckin` 返回错误，调度器只做 token keepalive。
+> WorkBuddyAI 国际版：`DailyCheckin` 实现为「免费模型对话保活 + 签到探测」（对用户透明，无前端界面）；
+> token 有效期 365 天，故 KeepaliveHours 设为 nil。详见 `docs/workbuddy国际版渠道接入备忘.md`。
 
 ## 6. 关键不变量（改动前必读）
 
+0. **每次代码变更后必须本地重新构建 `dist/wild-work.exe`**（见 §8）。
+   `dist/` 在 `.gitignore` 中，CI 只产出带平台后缀的 `wild-work-<os>-<arch>`，
+   **不会**生成 `dist/wild-work.exe`——该文件只能手动构建。
+   不重建会导致：本地运行的二进制与源码不一致（例如改了版本号但仍显示旧版本）。
 1. `PrepareBody` 三改写勿动：强制 `stream=true`、`tool_choice` 归一化、`developer→system`
 2. 日志/面板/消息框**零 token**：不得输出 access/refresh token（调试用假 token）
 3. auth 文件嵌套格式 `{auth:{...},account:{...}}`，`internal/auth.Parse` 与 login.SaveAuth 必须一致
@@ -134,8 +141,12 @@ POST /api/quit                     # 退出程序
 
 ## 8. 构建
 
+> ⚠️ **本地构建是日常约束**：任何代码变更后都要重新构建 `dist/wild-work.exe`
+> （见 §6 第 0 条）。CI 不生成该文件，且 `dist/` 不入版本控制。
+> 标准流程：`go build ./... && go vet ./... && go test ./...` 全绿后再构建。
+
 ```bash
-# Windows（WSL 交叉编译）
+# Windows（本机直接构建，或 WSL 交叉编译）
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-H windowsgui" -o dist/wild-work.exe ./cmd/wild-work
 
 # macOS（需 macOS 真机或 CI，cgo 必需）
@@ -145,8 +156,19 @@ GOOS=darwin GOARCH=arm64 go build -o dist/wild-work-darwin ./cmd/wild-work
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/wild-work-linux ./cmd/wild-work
 ```
 
+构建后核对版本号已进二进制（防止拿到旧文件）：
+
+```bash
+# Windows bash 下用 python 字节计数（strings 对 Go 二进制的长串不可靠）
+python -c "b=open('dist/wild-work.exe','rb').read(); print('new:',b.count(b'2.1.0'),'old:',b.count(b'2.0.1'))"
+# 期望：new >= 1 且 old == 0。若旧版本号仍在，说明构建未生效。
+```
+
 ## 9. 文档索引
 
 - [README.md](README.md) — 用户文档
 - [DEVELOPMENT.md](DEVELOPMENT.md) — 开发者文档（面向 AI Agent）
 - [HANDOFF.md](HANDOFF.md) — 交接文档（历史记录）
+- [docs/workbuddy国际版逆向分析备忘.md](docs/workbuddy国际版逆向分析备忘.md) — 国际版接口逆向（含抓包证据、模型倍率全表、凭据通用性验证）
+- [docs/workbuddy国际版渠道接入备忘.md](docs/workbuddy国际版渠道接入备忘.md) — 国际版渠道接入方案（接口规格、代码映射、调度设计、实施 Checklist）
+- [docs/upstream-reverse-engineering.md](docs/upstream-reverse-engineering.md) — 各上游渠道 API 逆向记录

@@ -104,6 +104,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 		}
 		if m.MaxInputTokens > 0 {
 			mi.ContextWindow = m.MaxInputTokens
+			mi.ContextFromAPI = true // 接口真实返回
 		}
 		out = append(out, mi)
 	}

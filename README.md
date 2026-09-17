@@ -1,22 +1,23 @@
 # wild-work
 
-> 多渠道账号聚合桌面工具——把 WorkBuddy(CodeBuddy)、TraeWork、Qoder 的多个账号聚合成一个 OpenAI 兼容 API，双击启动，浏览器管理。
+> 多渠道账号聚合桌面工具——把 WorkBuddy(CodeBuddy) 国内版/国际版、TraeWork、Qoder 的多个账号聚合成一个 OpenAI 兼容 API，双击启动，浏览器管理。
 
 [![GitHub](https://img.shields.io/badge/GitHub-rockswang%2Fworkbuddy--wild-blue)](https://github.com/rockswang/workbuddy-wild)
 
 ## 功能
 
 - **OpenAI 兼容代理**：`/v1/chat/completions`、`/v1/models`，支持流式/非流式，模型前缀路由
-- **三渠道聚合**：WorkBuddy(CodeBuddy) + TraeWork + Qoder，模型前缀路由，粘性路由优先复用账号以提升会话缓存利用率
+- **四渠道聚合**：WorkBuddy(CodeBuddy) + WorkBuddy 国际版 + TraeWork + Qoder，模型前缀路由，粘性路由优先复用账号以提升会话缓存利用率
 - **自动签到**：每日定时签到领额度，token 保活，冷却状态机
-- **Web 管理面板**：账号管理（添加/签到/刷新/停用/删除）、积分明细、渠道费率、API 配置
+- **自动领日活奖励**（WorkBuddy 国际版）：定时自动用免费模型对话保活，自动领取每日活跃奖励，无需手动签到
+- **Web 管理面板**：账号管理（添加/签到/刷新/停用/删除）、积分明细、模型列表和费率、API 配置
 - **系统托盘**：常驻右下角，双击打开面板，右键菜单操作
 - **跨平台**：Windows（完整支持）、macOS（代码已就绪，CI 构建）、Linux（无头模式）
 - **developer→system 角色转换**：自动将下游 Agent 发送的 `<developer>` 角色改写为 `<system>`，避免上游触发内容过滤
 
 ## 项目渊源
 
-本项目是 [workbuddy-wild](https://github.com/rockswang/workbuddy-wild)（v0.2.x）的重构版，去掉 wails/WebView2 GUI，改为「系统托盘 + 系统浏览器 Web UI」的轻量架构，内存占用更小、跨平台更简单。
+本项目最初算法来源于 [Sliverkiss/](https://github.com/Sliverkiss/) 大佬的 xxx2api 系列项目，本项目针对多渠道进行了聚合，针对 Windows 环境进行了适配，降低了使用门槛，并提供跨平台 Web 管理界面。
 
 ## 使用方式
 
@@ -25,7 +26,7 @@
 1. 从 [Releases](https://github.com/rockswang/workbuddy-wild/releases) 下载 `wild-work.exe`
 2. 放到任意目录，双击启动
 3. 右下角出现 W 图标，**双击托盘图标** → 浏览器打开 Web 管理面板
-4. 在面板中点击「+ WorkBuddy」或「+ TraeWork」或「+ Qoder」添加账号
+4. 在面板中点击「+ WorkBuddy」/「+ WorkBuddy 国际版」/「+ TraeWork」/「+ Qoder」添加账号
 5. 根据下方配置说明接入你的 AI 客户端
 
 ### 托盘菜单
@@ -144,18 +145,48 @@ Base URL: http://127.0.0.1:7863/v1
 API Key:  WildWorkAPI
 ```
 
-模型 ID 需带渠道前缀：`workbuddy/<model>`、`traework/<model>`、`qoder/<model>`。
+模型 ID 需带渠道前缀：`workbuddy/<model>`、`workbuddyai/<model>`、`traework/<model>`、`qoder/<model>`。
 
 ## 面板操作指南
 
 所有操作在 Web 管理面板中完成，按直觉操作即可：
 
 - **添加账号**：点击渠道按钮 → 确认对话框 → 浏览器窗口登录 → 自动完成
-- **账号管理**：卡片显示积分、签到状态；图标按钮操作（签到 ✓ / 刷新 ↻ / 停用 ⏸ / 删除 ✕）
+- **账号管理**：卡片显示积分、签到状态（WorkBuddy 国际版显示「自动领日活奖励」）；图标按钮操作（签到 ✓ / 刷新 ↻ / 停用 ⏸ / 删除 ✕）
 - **积分明细**：鼠标悬停积分数字显示套餐明细
 - **刷新积分**：面板顶部按钮，批量刷新全部账号余额
-- **渠道费率**：点击「刷新费率」从上游拉取最新模型定价
+- **模型列表和费率**：点击「刷新」从上游拉取最新模型定价；上游未返回定价的模型显示 `unknown`，免费模型高亮为 `Free`
 - **API 配置**：点击页面顶部 API 地址或 Key 修改
+
+## 常见问题
+
+### 1. Windows 提示“未知发布者”或报毒？
+
+本工具没有数字签名，因此可能会被 Windows 安全中心或杀毒软件拦截。如果报毒，请将本工具添加到排除项，方法如下：
+
+```
+设置 → 更新和安全 → Windows 安全中心 → 打开 Windows 安全中心 → 病毒和威胁防护 → “病毒和威胁防护”设置/管理设置 → 排除项/添加或删除排除项 → 添加排除项（文件或文件夹），把 exe 或所在目录加进去。
+```
+如果对本仓库发布包不放心，可以克隆到本地让 Agent 帮你审查一遍，然后自行基于源码构建（见 [DEVELOPMENT.md](DEVELOPMENT.md)）。
+
+### 2. TraeWork 通用积分不能用
+
+已知问题，TraeWork逆向不完整，原上游项目也没解决这个问题，建议多开几个 WorkBuddy 账号，速度快不排队。
+
+### 3. TraeWork DeepSeek V4 Flash 模型响应慢
+
+在官方客户端里这个模型也会排队，我的办法是 `ds4f` 用 WorkBuddy 的，`ds4p` 用 TraeWork 的。
+
+### 4. 如何绑定多个 WorkBuddy 国际版账号？
+
+添加新账号时，因为默认使用当前已登录的 github/Google 等账号自动登录，因此无法快速添加新的账号。
+这里给出我的方案，在浏览器右上角菜单选择“新建无痕窗口”，在窗口地址栏输入`http://127.0.0.1:7863`打开 WildWork 主界面，然后再增加新账号即可确保环境清洁。
+
+## 交流群
+
+微信扫码加入「野活儿老白蹬之家」，有问题欢迎在群里反馈：
+
+<img src="wechat_group.jpg" alt="野活儿老白蹬之家 微信群二维码" width="320">
 
 ## License
 

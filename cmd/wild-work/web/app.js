@@ -61,7 +61,7 @@ async function refreshFees() {
     await api("/api/fees/refresh", {});
     const fees = await api("/api/fees");
     renderFees(fees);
-    toast("费率已刷新");
+    toast("模型列表和费率已刷新");
   } catch (e) { toast(e.message); } finally {
     $("btnRefreshFees").disabled = false;
   }
@@ -141,6 +141,19 @@ function renderTopbar() {
   $("apiKeyDisplay").querySelector(".val").textContent = key === "" ? "（无鉴权）" : key;
 }
 
+// 渠道显示名与 CSS 短类名（后端 group / 费率 channel 均为 provider.Kind）。
+const CH_LABEL = { workbuddy: "WorkBuddy", workbuddyai: "WorkBuddy 国际版", traework: "TraeWork", qoder: "Qoder" };
+const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", qoder: "qoder" };
+const chLabel = (k) => CH_LABEL[k] || "WorkBuddy";
+const chClass = (k) => CH_CLASS[k] || "wb";
+// 不支持显式签到（手动按钮）的渠道：Qoder 无签到活动；
+// WorkBuddy 国际版不提供手动签到，而是自动对话保活领日活奖励。
+const NO_EXPLICIT_CHECKIN = new Set(["qoder", "workbuddyai"]);
+const noExplicitCheckin = (g) => NO_EXPLICIT_CHECKIN.has(g);
+// 无手动签到渠道的状态文案：国际版是「自动领日活奖励」，其余（Qoder）为「无签到」。
+const NO_CHECKIN_TAG = { workbuddyai: "自动领日活奖励" };
+const noCheckinText = (g) => NO_CHECKIN_TAG[g] || "无签到";
+
 function renderAccounts() {
   const grid = $("acctList");
   const empty = $("acctEmpty");
@@ -152,19 +165,22 @@ function renderAccounts() {
   empty.classList.add("hidden");
 
   grid.innerHTML = state.accounts.map((a) => {
-    const group = a.group === "traework" ? "trae" : (a.group === "qoder" ? "qoder" : "wb");
-    const groupName = a.group === "traework" ? "TraeWork" : (a.group === "qoder" ? "Qoder" : "WorkBuddy");
-    const noCheckin = a.group === "qoder"; // Qoder 无签到活动，签到按钮灰掉
+    const group = chClass(a.group);
+    const groupName = chLabel(a.group);
+    const noCheckin = noExplicitCheckin(a.group); // 无显式签到，签到按钮灰掉
+    const noCheckinTitle = a.group === "workbuddyai"
+      ? "无需手动签到：定时自动对话保活并领取日活奖励"
+      : `${groupName} 不支持手动签到`;
 
     const checkinTag = a.last_checkin_at
       ? `<span class="tag ${a.last_checkin_ok ? "ok" : "bad"}">${a.last_checkin_ok ? "签到成功" : "签到失败"}</span>`
-      : (noCheckin ? '<span class="tag neutral">无签到</span>' : '<span class="tag neutral">未签到</span>');
+      : (noCheckin ? `<span class="tag neutral" title="${esc(noCheckinTitle)}">${noCheckinText(a.group)}</span>` : '<span class="tag neutral">未签到</span>');
 
     const disabledClass = a.disabled ? " disabled" : "";
     const disableIcon = a.disabled ? "▶" : "⏸";
     const disableTitle = a.disabled ? "启用" : "停用";
     const checkinBtn = noCheckin
-      ? `<span class="icon-op off" title="Qoder 无签到活动" onclick="return false">✓</span>`
+      ? `<span class="icon-op off" title="${esc(noCheckinTitle)}" onclick="return false">✓</span>`
       : `<span class="icon-op" title="签到" onclick="checkin('${a.uid}')">✓</span>`;
 
     return `
@@ -208,32 +224,72 @@ function renderFees(fees) {
   }
 
   let html = `<div class="note">${esc(fees.note || "")}</div>`;
-  if (fees.cached_at) html += `<div class="note">上次更新：${esc(fees.cached_at)}</div>`;
+  if (fees.cached_at) html += `<div class="note">费率上次更新：${esc(fees.cached_at)}</div>`;
   if (fees.error) html += `<div class="note" style="color:var(--danger)">${esc(fees.error)}</div>`;
 
   html += `<table><thead><tr><th>模型</th><th>倍率</th><th>模型</th><th>倍率</th></tr></thead><tbody>`;
 
-  for (const ch of channels) {
-    const chName = ch.channel === "traework" ? "TraeWork" : (ch.channel === "qoder" ? "Qoder" : "WorkBuddy");
-    const chClass = ch.channel === "traework" ? "trae" : (ch.channel === "qoder" ? "qoder" : "wb");
-    html += `<tr class="ch-header ${chClass}"><td colspan="4">${esc(chName)}</td></tr>`;
+  const UNKNOWN_TIP = "上游未返回，请在客户端自行确认";
 
+  // 模型 id 的 tooltip：能拿到上下文则展示，否则明确说未知
+  const modelTip = (m) => {
+    const parts = [`模型：${m.model}`];
+    if (m.has_context && m.context_window) {
+      parts.push(`上下文窗口：${fmtTokens(m.context_window)}`);
+      if (m.max_tokens) parts.push(`最大输出：${fmtTokens(m.max_tokens)}`);
+    } else {
+      parts.push("上下文窗口：未知");
+      parts.push("最大输出：未知");
+      parts.push("（上游未提供该信息）");
+    }
+    return parts.join("\n");
+  };
+
+  // 单行倍率单元格
+  const rateCell = (m) => {
+    if (!m) return "";
+    if (!m.priced) {
+      return `<span class="rate-unknown" title="${esc(UNKNOWN_TIP)}">unknown</span>`;
+    }
+    if (m.free) {
+      return `<span class="rate-free" title="上游标注为免费（x0.00）">✦ Free</span>`;
+    }
+    return `<span class="rate-paid">x${m.rate.toFixed(2)}</span>`;
+  };
+
+  // 促销标签：使用上游给的颜色（原本被拼在文案里没解析）
+  const noteCell = (m) => {
+    if (!m || !m.note) return "";
+    const style = m.color ? ` style="color:${esc(m.color)}"` : "";
+    return ` <span class="rate-note"${style}>${esc(m.note)}</span>`;
+  };
+
+  for (const ch of channels) {
+    const chName = chLabel(ch.channel);
+    const chCls = chClass(ch.channel);
     const models = ch.models || [];
+    html += `<tr class="ch-header ${chCls}"><td colspan="4">${esc(chName)}</td></tr>`;
     // 每行两个模型
     for (let i = 0; i < models.length; i += 2) {
       const m1 = models[i];
       const m2 = models[i + 1];
-      const c1 = m1 ? `<code>${esc(m1.model)}</code>` : "";
-      const r1 = m1 ? (m1.rate ? `x${m1.rate.toFixed(2)}` : "auto") : "";
-      const c2 = m2 ? `<code>${esc(m2.model)}</code>` : "";
-      const r2 = m2 ? (m2.rate ? `x${m2.rate.toFixed(2)}` : "-") : "";
-      html += `<tr><td>${c1}</td><td>${r1}</td><td>${c2}</td><td>${r2}</td></tr>`;
+      const id1 = m1 ? `<code title="${esc(modelTip(m1))}">${esc(m1.model)}</code>${noteCell(m1)}` : "";
+      const id2 = m2 ? `<code title="${esc(modelTip(m2))}">${esc(m2.model)}</code>${noteCell(m2)}` : "";
+      html += `<tr><td>${id1}</td><td>${rateCell(m1)}</td><td>${id2}</td><td>${rateCell(m2)}</td></tr>`;
     }
   }
 
   html += `</tbody></table>`;
   html += `<div class="note" style="margin-top:8px">${esc(fees.disclaimer || "")}</div>`;
   box.innerHTML = html;
+}
+
+// fmtTokens 把 token 数格式化为 1M / 192k 形式。
+function fmtTokens(n) {
+  if (!n) return "-";
+  if (n >= 1000000 && n % 1000000 === 0) return `${n / 1000000}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(n);
 }
 
 // ---------- 账号操作 ----------
@@ -280,9 +336,9 @@ async function checkinAll() {
   try {
     const r = await api("/api/account/checkin_all", {});
     const ok = (r.results || []).filter((x) => x.ok).length;
-    const skip = (state.accounts || []).filter((a) => a.group === "qoder").length;
+    const skip = (state.accounts || []).filter((a) => noExplicitCheckin(a.group)).length;
     const total = (r.results || []).length + skip;
-    toast(skip ? `批量签到完成：成功 ${ok} / ${total}（Qoder ${skip} 个无签到跳过）` : `批量签到完成：成功 ${ok} / 共 ${total}`);
+    toast(skip ? `批量签到完成：成功 ${ok} / ${total}（${skip} 个账号无签到活动跳过）` : `批量签到完成：成功 ${ok} / 共 ${total}`);
     loadState();
   } catch (e) { toast(e.message); } finally {
     $("btnCheckinAll").disabled = false;
@@ -302,12 +358,17 @@ async function refreshAll() {
 
 // ---------- 登录 ----------
 let pendingChannel = null;
+// 无手动签到渠道的登录提示差异文案（国际版会自动领日活奖励）。
+const NO_CHECKIN_LOGIN_HINT = {
+  workbuddyai: "（无需手动签到，定时自动对话保活并领取日活奖励）",
+  qoder: "（Qoder 渠道无签到活动，仅 API 转发）",
+};
 function promptLogin(channel) {
   pendingChannel = channel;
-  const name = channel === "traework" ? "TraeWork" : (channel === "qoder" ? "Qoder" : "WorkBuddy");
+  const name = chLabel(channel);
   $("lcTitle").textContent = "添加 " + name + " 账号";
-  $("lcMsg").textContent = channel === "qoder"
-    ? `点击「登录${name}」将打开浏览器窗口，请按照指示正常登录${name}账号，登录成功后关闭浏览器窗口即可。（${name} 渠道无签到活动，仅 API 转发）`
+  $("lcMsg").textContent = noExplicitCheckin(channel)
+    ? `点击「登录${name}」将打开浏览器窗口，请按照指示正常登录${name}账号，登录成功后关闭浏览器窗口即可。${NO_CHECKIN_LOGIN_HINT[channel] || ""}`
     : `点击「登录${name}」将打开浏览器窗口，请按照指示正常登录${name}账号，登录成功后关闭浏览器窗口即可。`;
   $("btnLoginConfirm").textContent = "登录" + name;
   $("loginConfirmOverlay").classList.remove("hidden");
@@ -322,7 +383,7 @@ async function startLogin(channel) {
     const r = await api("/api/login/start", { channel });
     const url = r.auth_url;
     if (!url) { toast("无法获取登录链接"); return; }
-    $("loginTitle").textContent = channel === "traework" ? "添加 TraeWork 账号" : (channel === "qoder" ? "添加 Qoder 账号" : "添加 WorkBuddy 账号");
+    $("loginTitle").textContent = `添加 ${chLabel(channel)} 账号`;
     $("loginMsg").textContent = "请在浏览器新窗口中完成登录…";
     $("loginOverlay").classList.remove("hidden");
     $("btnCopyUrl").dataset.url = url;
@@ -489,6 +550,7 @@ function confirmDialog(msg, onOk) {
 // ---------- 事件绑定 ----------
 function bind() {
   $("btnAddWB").onclick = () => promptLogin("workbuddy");
+  $("btnAddWBAI").onclick = () => promptLogin("workbuddyai");
   $("btnAddTrae").onclick = () => promptLogin("traework");
   $("btnAddQoder").onclick = () => promptLogin("qoder");
   $("btnCheckinAll").onclick = checkinAll;

@@ -101,6 +101,7 @@ body {
 
 .badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; color: #fff; white-space: nowrap; }
 .badge.wb { background: var(--primary); }
+.badge.wbai { background: #0d9488; }
 .badge.trae { background: #0891b2; }
 .badge.qoder { background: #7c3aed; }
 
@@ -159,9 +160,25 @@ body {
   padding: 8px 10px; border-bottom: 2px solid var(--border);
 }
 .fees .ch-header.wb td { color: var(--primary); }
+.fees .ch-header.wbai td { color: #0d9488; }
 .fees .ch-header.trae td { color: #0891b2; }
 .fees .ch-header.qoder td { color: #7c3aed; }
+.btn.alt.wbai { background: #0d9488; border-color: #0d9488; color: #fff; }
 .fees .note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.fees td.dim { color: var(--muted); font-size: 12px; }
+/* 倍率显示：Free 高亮 / 已定价 / 未知（带 tooltip） */
+.fees .rate-free {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  background: #dcfce7; color: #15803d; font-weight: 600; font-size: 12px;
+  border: 1px solid #86efac; cursor: default;
+}
+.fees .rate-paid { font-variant-numeric: tabular-nums; }
+.fees .rate-unknown {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  background: #f1f5f9; color: #94a3b8; font-size: 12px;
+  border: 1px dashed var(--border); cursor: help;
+}
+.fees .rate-note { color: #d97706; font-size: 11px; }
 
 /* 配置说明 */
 .docs { font-size: 13px; }

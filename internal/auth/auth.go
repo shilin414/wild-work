@@ -179,7 +179,7 @@ func (a *Auth) saveAtomicLocked() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
-		doc := map[string]any{
+	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
 			"refreshToken": a.RefreshToken,
@@ -229,6 +229,30 @@ func LoadWorkBuddyDir(dir, wantRegion string) ([]*Auth, error) {
 			continue
 		}
 		a.Kind, a.FilePath = "workbuddy", f
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// LoadWorkBuddyAiDir 扫描 WorkBuddy 国际版凭证（workbuddyai-*.json）。
+// 不按 region 过滤：国际版凭证的 domain 天然为 www.workbuddy.ai，
+// 路由由每个 Auth 自身的 domain 决定，与全局 region 配置无关。
+func LoadWorkBuddyAiDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "workbuddyai-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Auth
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		a, err := Parse(raw)
+		if err != nil {
+			continue
+		}
+		a.Kind, a.FilePath = "workbuddyai", f
 		out = append(out, a)
 	}
 	return out, nil

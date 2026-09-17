@@ -22,8 +22,9 @@ import (
 	"wild-work/internal/login"
 	loginqoder "wild-work/internal/login_qoder"
 	logintrae "wild-work/internal/login_trae"
-	"wild-work/internal/pool"
+	"wild-work/internal/login_wbai"
 	"wild-work/internal/platform"
+	"wild-work/internal/pool"
 	"wild-work/internal/provider"
 	"wild-work/internal/qoder"
 	"wild-work/internal/scheduler"
@@ -31,7 +32,7 @@ import (
 )
 
 // Version 版本号。
-const Version = "2.0.2"
+const Version = "2.1.0"
 
 const (
 	loginTimeout   = 5 * time.Minute
@@ -82,15 +83,16 @@ type App struct {
 	pricingCache   []provider.ModelPricing // 本地缓存
 	pricingFetched time.Time
 	pricingErr     string // 最近一次拉取错误
+	pricingBusy    bool   // 防并发刷新（启动刷新与面板触发可能重叠）
 }
 
 // New 构建 App 并接管全局日志（写文件 + 环形缓冲）。
 func New(opts Options) (*App, error) {
 	a := &App{
-		cfgPath:    opts.ConfigPath,
-		cfg:        opts.Config,
-		runtimes:   opts.Runtimes,
-		handler:    opts.Handler,
+		cfgPath:  opts.ConfigPath,
+		cfg:      opts.Config,
+		runtimes: opts.Runtimes,
+		handler:  opts.Handler,
 	}
 	a.loginStateFP = filepath.Join(filepath.Dir(opts.Config.StateFile), "login-state.json")
 	a.pricingFP = filepath.Join(filepath.Dir(opts.Config.StateFile), "pricing-cache.json")
@@ -125,7 +127,7 @@ func (a *App) runtime(kind provider.Kind) *Runtime {
 }
 
 func (a *App) firstRuntime() *Runtime {
-	for _, k := range []provider.Kind{provider.WorkBuddy, provider.TraeWork, provider.Qoder} {
+	for _, k := range []provider.Kind{provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.Qoder} {
 		if rt := a.runtime(k); rt != nil {
 			return rt
 		}
@@ -152,6 +154,14 @@ func (a *App) allStatuses() []pool.Status {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out
+}
+
+// noExplicitCheckinKinds 不支持显式签到（手动按钮）的渠道。
+// Qoder 无签到活动（DailyCheckin 直接报错）；
+// WorkBuddy 国际版改为定时自动对话保活并领取日活奖励（详见 workbuddyai.DailyCheckin），
+// 无需用户手动触发，故也不提供手动签到入口。
+func noExplicitCheckin(k provider.Kind) bool {
+	return k == provider.Qoder || k == provider.WorkBuddyAI
 }
 
 func (a *App) findRuntimeAuth(uid string) (*Runtime, *auth.Auth) {
@@ -250,13 +260,15 @@ func (a *App) Quit() {
 // 账号操作
 // ---------------------------------------------------------------------------
 
-// StartLoginFor 发起指定渠道登录：workbuddy / traework / qoder。
+// StartLoginFor 发起指定渠道登录：workbuddy / workbuddyai / traework / qoder。
 func (a *App) StartLoginFor(kind string) (string, error) {
 	k := provider.Kind(strings.TrimSpace(kind))
 	if k == "" {
 		k = provider.WorkBuddy
 	}
-	if k != provider.WorkBuddy && k != provider.TraeWork && k != provider.Qoder {
+	switch k {
+	case provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.Qoder:
+	default:
 		return "", fmt.Errorf("unknown login provider %s", kind)
 	}
 	a.muLogin.Lock()
@@ -272,6 +284,8 @@ func (a *App) StartLoginFor(kind string) (string, error) {
 		a.loginClient = logintrae.NewClient()
 	case provider.Qoder:
 		a.loginClient = loginqoder.NewClient()
+	case provider.WorkBuddyAI:
+		a.loginClient = loginwbai.NewClient()
 	default:
 		a.loginClient = login.NewClient()
 	}
@@ -285,6 +299,8 @@ func (a *App) StartLoginFor(kind string) (string, error) {
 		authURL, err = logintrae.Start(a.loginClient, a.loginStateFP)
 	case provider.Qoder:
 		authURL, err = loginqoder.Start(a.loginClient, a.loginStateFP)
+	case provider.WorkBuddyAI:
+		authURL, err = loginwbai.Start(a.loginClient, a.loginStateFP)
 	default:
 		authURL, err = login.Start(a.loginClient, a.loginStateFP)
 		if err == nil {
@@ -362,6 +378,17 @@ func (a *App) pollLogin(ctx context.Context) {
 			}
 			continue
 		}
+		if a.loginKind == provider.WorkBuddyAI {
+			r, err := loginwbai.Poll(a.loginClient, a.loginStateFP)
+			if err == nil {
+				a.completeWbaiLogin(r)
+				return
+			}
+			if !errors.Is(err, loginwbai.ErrPending) {
+				log.Printf("workbuddyai login poll failed: %v", err)
+			}
+			continue
+		}
 		r, err := login.Poll(a.loginClient, a.loginStateFP)
 		if err == nil {
 			a.completeLogin(r)
@@ -384,6 +411,7 @@ func (a *App) completeLogin(r login.Result) {
 	log.Printf("workbuddy 登录凭证已保存 uid=%s file=%s", r.UID, filepath.Base(fp))
 	a.reloadAccounts()
 	a.finishLogin()
+	a.afterAccountAdded(provider.WorkBuddy)
 	a.safeGo(func() {
 		rt := a.runtime(provider.WorkBuddy)
 		if rt == nil || rt.Scheduler == nil {
@@ -393,6 +421,53 @@ func (a *App) completeLogin(r login.Result) {
 			log.Printf("新账号签到失败 %s: %v", r.Nickname, err)
 		} else {
 			log.Printf("新账号签到完成 %s：%s", r.Nickname, res.Msg)
+		}
+	})
+}
+
+// afterAccountAdded 新账号就绪后的统一收尾：刷新模型列表与费率。
+// 原因：模型列表与费率都按「已接入账号」填充，新渠道/新账号加入后，
+// 若不主动失效缓存，两处都要等 TTL（1h / 1h）才更新，面板上显示不完整。
+// 故每个渠道登录成功后统一调用。
+func (a *App) afterAccountAdded(kind provider.Kind) {
+	// 1) 使动态模型缓存失效，下次 /v1/models 与面板重新拉上游
+	if a.handler != nil {
+		a.handler.InvalidateModels()
+	}
+	// 2) 立即刷新费率为后台任务（含模型列表拉取），不阻塞登录流程
+	a.safeGo(func() {
+		a.RefreshPricing()
+		log.Printf("account added platform=%s: models+pricing refreshed", kind)
+	})
+}
+
+// completeWbaiLogin 国际版登录成功：写 auth 文件、重载账号池、异步拉取初始积分。
+// 不触发签到（国际版无签到活动）；但必须拉一次余额，
+// 否则新账号在面板上显示 0 积分，需用户手动点「刷新积分」才正确。
+func (a *App) completeWbaiLogin(r loginwbai.Result) {
+	log.Printf("workbuddyai 登录成功 uid=%s nickname=%s expires_in=%d refresh_token=%t",
+		r.UID, r.Nickname, r.ExpiresIn, r.RefreshToken != "")
+	if r.UID == "" {
+		log.Printf("workbuddyai 登录失败：响应缺 uid")
+		a.finishLogin()
+		return
+	}
+	fp, err := loginwbai.SaveAuth(a.cfg.AuthDir, r)
+	if err != nil {
+		log.Printf("workbuddyai 登录保存凭证失败 uid=%s err=%v", r.UID, err)
+		a.finishLogin()
+		return
+	}
+	log.Printf("workbuddyai 登录凭证已保存 uid=%s file=%s", r.UID, filepath.Base(fp))
+	a.reloadAccounts()
+	a.finishLogin()
+	a.afterAccountAdded(provider.WorkBuddyAI)
+	// 新账号首次拉取余额（异步，不阻塞登录流程）
+	a.safeGo(func() {
+		if remain, err := a.RefreshCredits(r.UID); err != nil {
+			log.Printf("workbuddyai 新账号积分获取失败 %s: %v", r.Nickname, err)
+		} else {
+			log.Printf("workbuddyai 新账号积分获取完成 %s: %d", r.Nickname, remain)
 		}
 	})
 }
@@ -407,6 +482,7 @@ func (a *App) completeTraeLogin(r logintrae.Result) {
 	log.Printf("traework 登录凭证已保存 uid=%s file=%s", r.UID, filepath.Base(fp))
 	a.reloadAccounts()
 	a.finishLogin()
+	a.afterAccountAdded(provider.TraeWork)
 	a.safeGo(func() {
 		rt := a.runtime(provider.TraeWork)
 		if rt == nil || rt.Scheduler == nil {
@@ -434,6 +510,7 @@ func (a *App) completeQoderLogin(r loginqoder.Result) {
 	log.Printf("qoder 登录凭证已保存 uid=%s file=%s", r.UID, filepath.Base(fp))
 	a.reloadAccounts()
 	a.finishLogin()
+	a.afterAccountAdded(provider.Qoder)
 }
 
 func (a *App) finishLogin() {
@@ -470,6 +547,14 @@ func (a *App) reloadAccounts() {
 			rt.Pool.SyncToDir(auths)
 		}
 	}
+	if rt := a.runtime(provider.WorkBuddyAI); rt != nil && rt.Pool != nil {
+		auths, err := auth.LoadWorkBuddyAiDir(a.cfg.AuthDir)
+		if err != nil {
+			log.Printf("reload workbuddyai accounts: %v", err)
+		} else {
+			rt.Pool.SyncToDir(auths)
+		}
+	}
 }
 
 // CheckinAccount 单个账号立即签到。
@@ -478,8 +563,11 @@ func (a *App) CheckinAccount(uid string) (scheduler.CheckinResult, error) {
 	if rt == nil || rt.Scheduler == nil {
 		return scheduler.CheckinResult{}, fmt.Errorf("unknown account %s", uid)
 	}
-	if rt.Kind == provider.Qoder {
-		return scheduler.CheckinResult{}, fmt.Errorf("Qoder 渠道无签到活动")
+	if noExplicitCheckin(rt.Kind) {
+		if rt.Kind == provider.WorkBuddyAI {
+			return scheduler.CheckinResult{}, fmt.Errorf("workbuddyai 渠道无需手动签到，已定时自动领取日活奖励")
+		}
+		return scheduler.CheckinResult{}, fmt.Errorf("%s 渠道不支持手动签到", rt.Kind)
 	}
 	res, err := rt.Scheduler.CheckinAccount(uid)
 	if err != nil {
@@ -497,7 +585,7 @@ func (a *App) CheckinAll() []scheduler.CheckinResult {
 		if rt == nil || rt.Pool == nil || rt.Scheduler == nil {
 			continue
 		}
-		if rt.Kind == provider.Qoder { // Qoder 无签到活动，跳过
+		if noExplicitCheckin(rt.Kind) { // 无签到活动渠道，跳过
 			continue
 		}
 		// 停用/冷却中的账号同样参与：签到只领积分，不会解除停用。
@@ -519,6 +607,100 @@ func (a *App) CheckinAll() []scheduler.CheckinResult {
 	}
 	log.Printf("批量签到完成：total=%d ok=%d failed=%d", len(results), ok, len(results)-ok)
 	return results
+}
+
+// CreditRefreshInterval 积分自动刷新间隔。
+// 无签到活动的渠道（如 WorkBuddy 国际版）积分不随签到更新，
+// 若不定期刷新：面板长期显示旧值（新账号则一直为 0），
+// 且 Pool.Pick() 按积分排序会因此长期选错账号。
+const CreditRefreshInterval = 30 * time.Minute
+
+// StartCreditAutoRefresh 后台定期刷新指定渠道的账号积分。
+// 启动立即刷一次，之后每隔 interval 一次；单账号失败不影响其他账号。
+//
+// 范围限制在传入的 kinds：国内版 workbuddy 有自己的签到刷新途径，
+// 不纳入此循环，以免改变其行为。
+func (a *App) StartCreditAutoRefresh(ctx context.Context, kinds []provider.Kind, interval time.Duration) {
+	if interval <= 0 {
+		interval = CreditRefreshInterval
+	}
+	go func() {
+		refresh := func() {
+			for _, k := range kinds {
+				rt := a.runtime(k)
+				if rt == nil || rt.Pool == nil || rt.Upstream == nil {
+					continue
+				}
+				for _, st := range rt.Pool.List() {
+					if st.Disabled {
+						continue
+					}
+					au := rt.Pool.AuthByUID(st.UID)
+					if au == nil {
+						continue
+					}
+					// token 临近过期时先刷新（国际版 token 有效期长，通常不触发）
+					if au.NeedsRefresh(10 * time.Minute) {
+						if err := rt.Upstream.RefreshToken(au); err != nil {
+							log.Printf("credit auto-refresh token refresh failed platform=%s uid=%s err=%v", k, st.UID, err)
+							continue
+						}
+						if err := au.SaveAtomic(); err != nil {
+							log.Printf("credit auto-refresh token save failed platform=%s uid=%s err=%v", k, st.UID, err)
+						}
+					}
+					remain, err := rt.Upstream.UserResource(au)
+					if err != nil {
+						log.Printf("credit auto-refresh failed platform=%s uid=%s err=%v", k, st.UID, err)
+						continue
+					}
+					rt.Pool.SetCredits(st.UID, remain)
+					log.Printf("credit auto-refresh platform=%s uid=%s remain=%d", k, st.UID, remain)
+				}
+			}
+		}
+		refresh() // 启动即刷：新账号不必等下一个周期
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				refresh()
+			}
+		}
+	}()
+}
+
+// PricingRefreshInterval 模型列表与费率的后台自动刷新间隔。
+// 两者都随上游变动，且面板依赖它们展示，故定期刷新保持新鲜。
+const PricingRefreshInterval = 30 * time.Minute
+
+// StartPricingAutoRefresh 后台定期刷新「模型列表 + 费率」。
+// 启动立即刷一次：否则刚启动时费率缓存为空，面板下方全是 unknown，观感不佳。
+// 之后每隔 interval 一次；取消 ctx 即停止。
+func (a *App) StartPricingAutoRefresh(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = PricingRefreshInterval
+	}
+	go func() {
+		// 启动刷新：同时失效动态模型缓存，保证模型列表也是新的
+		if a.handler != nil {
+			a.handler.InvalidateModels()
+		}
+		a.RefreshPricing()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				a.RefreshPricing()
+			}
+		}
+	}()
 }
 
 // RefreshCredits 刷新单个账号积分。
@@ -585,18 +767,18 @@ func (a *App) RefreshAll() RefreshSummary {
 
 // RefreshSummary 积分刷新汇总（托盘消息框内容）。
 type RefreshSummary struct {
-	Busy      bool                        `json:"busy"`
-	Total     int                         `json:"total"`
-	OK        int                         `json:"ok"`
-	Failed    int                         `json:"failed"`
-	Platforms map[string]PlatformSummary  `json:"platforms"`
+	Busy      bool                       `json:"busy"`
+	Total     int                        `json:"total"`
+	OK        int                        `json:"ok"`
+	Failed    int                        `json:"failed"`
+	Platforms map[string]PlatformSummary `json:"platforms"`
 }
 
 // PlatformSummary 单个渠道汇总。
 type PlatformSummary struct {
-	OK       int               `json:"ok"`
-	Failed   int               `json:"failed"`
-	Accounts []AccountRefresh  `json:"accounts"`
+	OK       int              `json:"ok"`
+	Failed   int              `json:"failed"`
+	Accounts []AccountRefresh `json:"accounts"`
 }
 
 // AccountRefresh 单账号刷新结果。
@@ -833,6 +1015,9 @@ func (a *App) accountGroup(uid string) string {
 		if au.FilePath != "" && strings.HasPrefix(filepath.Base(au.FilePath), "qoder") {
 			return "qoder"
 		}
+		if au.FilePath != "" && strings.HasPrefix(filepath.Base(au.FilePath), "workbuddyai-") {
+			return "workbuddyai"
+		}
 	}
 	return "workbuddy"
 }
@@ -1040,49 +1225,131 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 // 渠道费率信息（本地缓存 + 按需刷新）
 // ---------------------------------------------------------------------------
 
-// FeesInfo 返回渠道费率说明（本地缓存优先，有账号时尝试拉取上游）。
+// feesChannel 一个渠道在「模型列表和费率」面板中的分组数据。
+type feesChannel struct {
+	Channel string         `json:"channel"`
+	Models  []feesModelRow `json:"models"`
+}
+
+// feesModelRow 一行模型：来自渠道 models 列表，尽可能配上费率。
+type feesModelRow struct {
+	Model string `json:"model"`
+	// Priced 表示上游费率接口对该模型返回了可用的倍率值。
+	// 注意：credits 字段缺失（如 CN 的 auto 调度器）也算未定价，
+	// 不能把「缺字段解析出的 0」当成免费。
+	Priced bool    `json:"priced"`
+	Rate   float64 `json:"rate"`           // 倍率（Priced=false 时无意义）
+	Free   bool    `json:"free"`           // 上游明确标注倍率为 0（x0.00）
+	Note   string  `json:"note,omitempty"` // 促销/标签说明（已剔除颜色）
+	// Color 为促销标签颜色（形如 "#FF0000"），无则空。
+	Color string `json:"color,omitempty"`
+	// HasContext 标记该模型的上下文窗口/最大输出是否来自上游接口。
+	// false 表示无可靠数据（硬编码估算或上游不返回），前端提示「未知」而非展示数字。
+	HasContext    bool  `json:"has_context"`
+	ContextWindow int64 `json:"context_window,omitempty"`
+	MaxTokens     int64 `json:"max_tokens,omitempty"`
+}
+
+// buildFeesChannels 以「渠道 models 列表」为基准组表：
+//   - 每个渠道的模型行来自该渠道当前生效的 models（与 /v1/models 同源）；
+//   - 再用该渠道费率接口返回的 model→rate 映射逐行填充；
+//   - 未在费率接口中出现的模型标记 Priced=false（前端显示 unknown + tooltip）；
+//   - 费率接口中多出的模型（models 列表中不存在）不展示，避免与 /v1/models 不一致。
+func buildFeesChannels(modelsByKind map[provider.Kind][]provider.ModelInfo,
+	pricing []provider.ModelPricing, order []provider.Kind) []feesChannel {
+	// 渠道 → (model → pricing)
+	byChannel := make(map[string]map[string]provider.ModelPricing)
+	for _, p := range pricing {
+		m := byChannel[p.Channel]
+		if m == nil {
+			m = make(map[string]provider.ModelPricing)
+			byChannel[p.Channel] = m
+		}
+		m[p.Model] = p
+	}
+	out := make([]feesChannel, 0, len(order))
+	for _, k := range order {
+		infos := modelsByKind[k]
+		if len(infos) == 0 {
+			continue
+		}
+		prices := byChannel[k.String()]
+		rows := make([]feesModelRow, 0, len(infos))
+		for _, mi := range infos {
+			row := feesModelRow{
+				Model:         mi.ID,
+				ContextWindow: mi.ContextWindow,
+				MaxTokens:     mi.MaxTokens,
+				// 仅上游接口返回的上下文可信；硬编码估算值不展示数字。
+				HasContext: mi.ContextFromAPI,
+			}
+			if p, ok := prices[mi.ID]; ok {
+				row.Priced = p.IsExplicit() // 缺倍率字段（如 auto）不算已定价
+				row.Rate = p.Rate
+				row.Free = p.IsExplicit() && p.Rate == 0
+				row.Note = p.Note
+				row.Color = p.Color
+			}
+			rows = append(rows, row)
+		}
+		// 排序：免费在前（便于发现可用免费模型），其余按倍率升序，未定价置后
+		sort.SliceStable(rows, func(i, j int) bool {
+			a, b := rows[i], rows[j]
+			if a.Priced != b.Priced {
+				return a.Priced // 已定价的排前
+			}
+			if a.Rate != b.Rate {
+				return a.Rate < b.Rate
+			}
+			return a.Model < b.Model
+		})
+		out = append(out, feesChannel{Channel: k.String(), Models: rows})
+	}
+	return out
+}
+
+// FeesInfo 返回「模型列表和费率」面板数据。
+// 以各渠道当前生效的模型列表为基准（与 /v1/models 同源），逐行配上费率：
+// 上游未返回倍率的模型标记 priced=false，前端显示 unknown。
 func (a *App) FeesInfo() map[string]any {
 	a.pricingMu.Lock()
 	cached := a.pricingCache
 	errMsg := a.pricingErr
+	stale := time.Since(a.pricingFetched) > time.Hour
 	a.pricingMu.Unlock()
 
+	// 缓存过期时后台静默刷新
+	if len(cached) > 0 && stale {
+		go a.safeGo(func() { a.RefreshPricing() })
+	}
+
+	// 模型列表：优先用 server 的渠道清单（与 /v1/models 完全一致）
+	var modelsByKind map[provider.Kind][]provider.ModelInfo
+	if a.handler != nil {
+		modelsByKind = a.handler.ChannelModels()
+	} else {
+		modelsByKind = a.staticModelFallback()
+	}
+	if len(modelsByKind) == 0 {
+		modelsByKind = a.staticModelFallback()
+	}
+
+	// 首次加载且无缓存：异步拉取费率，先展示（unknown 占位）
 	if len(cached) == 0 {
-		// 首次加载：异步拉取，先返回静态兜底
-		go a.safeGo(func() { a.RefreshPricing() })
-		return staticFeesInfo()
-	}
-
-	// 缓存超过 1 小时，后台静默刷新
-	if time.Since(a.pricingFetched) > time.Hour {
 		go a.safeGo(func() { a.RefreshPricing() })
 	}
 
-	// 按渠道分组
-	groups := map[string][]map[string]any{}
-	for _, p := range cached {
-		groups[p.Channel] = append(groups[p.Channel], map[string]any{
-			"model": p.Model,
-			"rate":  p.Rate,
-			"note":  p.Note,
-		})
-	}
-
-	channels := make([]map[string]any, 0)
-	for _, ch := range []string{"workbuddy", "traework", "qoder"} {
-		if models, ok := groups[ch]; ok {
-			channels = append(channels, map[string]any{
-				"channel": ch,
-				"models":  models,
-			})
-		}
-	}
+	channels := buildFeesChannels(modelsByKind, cached, []provider.Kind{
+		provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.Qoder,
+	})
 
 	result := map[string]any{
-		"note":       "费率随上游平台政策动态变化，请以官方为准；点击「刷新费率」重新拉取。",
+		"note":       "本表以各渠道实际可用模型列表为准；倍率为空的模型表示上游未返回定价（未知）。",
 		"channels":   channels,
 		"disclaimer": "本工具仅聚合转发，不参与定价；渠道费率以各上游官方页面为准。",
-		"cached_at":  a.pricingFetched.Format("01-02 15:04"),
+	}
+	if len(cached) > 0 {
+		result["cached_at"] = a.pricingFetched.Format("01-02 15:04")
 	}
 	if errMsg != "" {
 		result["error"] = errMsg
@@ -1090,8 +1357,30 @@ func (a *App) FeesInfo() map[string]any {
 	return result
 }
 
+// staticModelFallback 无 handler 时的渠道→静态模型表兜底。
+// app.Runtime 不带静态表（那是 server.Runtime 的字段），故此处返回空，
+// 由 buildFeesChannels 自行跳过无模型的渠道；
+// 实际运行中 handler 总是已注入（SetHandler），不会走到这里。
+func (a *App) staticModelFallback() map[provider.Kind][]provider.ModelInfo {
+	return map[provider.Kind][]provider.ModelInfo{}
+}
+
 // RefreshPricing 从所有已接入渠道拉取最新定价并更新缓存。
+// 并发调用会被丢弃（已有一次在跑）——启动刷新与面板「刷新」可能重叠。
 func (a *App) RefreshPricing() {
+	a.pricingMu.Lock()
+	if a.pricingBusy {
+		a.pricingMu.Unlock()
+		return
+	}
+	a.pricingBusy = true
+	a.pricingMu.Unlock()
+	defer func() {
+		a.pricingMu.Lock()
+		a.pricingBusy = false
+		a.pricingMu.Unlock()
+	}()
+
 	allPricing := make([]provider.ModelPricing, 0)
 	var errs []string
 
@@ -1179,41 +1468,6 @@ func (a *App) savePricingCache() {
 		return
 	}
 	_ = os.WriteFile(a.pricingFP, raw, 0o644)
-}
-
-// staticFeesInfo 静态兜底费率说明（无账号/首次加载时）。
-func staticFeesInfo() map[string]any {
-	return map[string]any{
-		"note": "费率随上游平台政策动态变化，请以官方为准；添加账号后点击「刷新费率」拉取实时数据。",
-		"channels": []map[string]any{
-			{
-				"channel": "workbuddy",
-				"models": []map[string]any{
-					{"model": "auto", "rate": 0, "note": "自动路由最优模型"},
-					{"model": "deepseek-v4-*", "rate": 0, "note": "按对话计费"},
-					{"model": "glm-*", "rate": 0, "note": "按对话计费"},
-					{"model": "kimi-* / minimax-* / hy3", "rate": 0, "note": "按对话计费"},
-				},
-			},
-			{
-				"channel": "traework",
-				"models": []map[string]any{
-					{"model": "DeepSeek-*", "rate": 0, "note": "按 token 计费"},
-					{"model": "glm-5*", "rate": 0, "note": "按 token 计费"},
-					{"model": "Doubao-* / qwen-*", "rate": 0, "note": "按 token 计费"},
-				},
-			},
-			{
-				"channel": "qoder",
-				"models": []map[string]any{
-					{"model": "deepseek-v4-*", "rate": 0, "note": "按积分计费"},
-					{"model": "qwen3.* / glm-5.*", "rate": 0, "note": "按积分计费"},
-					{"model": "kimi-* / minimax-* / auto", "rate": 0, "note": "按积分计费"},
-				},
-			},
-		},
-		"disclaimer": "本工具仅聚合转发，不参与定价；渠道费率以各上游官方页面为准。",
-	}
 }
 
 // ---------------------------------------------------------------------------

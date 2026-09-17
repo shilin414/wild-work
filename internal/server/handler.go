@@ -26,6 +26,12 @@ type Runtime struct {
 	Upstream     provider.Upstream
 	StaticModels []provider.ModelInfo
 
+	// NoCooldownOnServerError 声明该渠道的上游 5xx 属于网关/基础设施抖动
+	// （账号本身健康），不应计入账号错误触发冷却。
+	// WorkBuddy 国际版开启（其 openresty 网关实测间歇性 502/503/504）。
+	// 其余渠道保持 false，行为不变。
+	NoCooldownOnServerError bool
+
 	mu       sync.RWMutex
 	models   []provider.ModelInfo
 	fetched  time.Time
@@ -120,6 +126,7 @@ func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 // 优先使用上次成功路由的账号，直到：
 //   - 账号进入冷却/禁用状态
 //   - 连续成功请求达到 maxReqs 次（默认 50），自动轮换
+//
 // 任一条件触发则降级为 Pick() 选新账号并重置粘性记录。
 func (h *Handler) pickWithSticky(rt *Runtime) *auth.Auth {
 	const defaultMaxReqs = 50
@@ -395,6 +402,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rt.Pool.Disable(acct.UID, "session dead")
 			case provider.ErrNotFound:
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+			case provider.ErrServer:
+				if rt.NoCooldownOnServerError {
+					// 该渠道声明 5xx 为上游网关抖动（账号本身健康），
+					// 不计入账号错误，避免一夜抖动把所有账号冷却。
+					log.Printf("upstream server error platform=%s uid=%s status=%d（不计入账号错误）",
+						rt.Kind, acct.UID, status)
+				} else {
+					rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				}
 			default:
 				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			}
@@ -462,6 +478,45 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	return json.Marshal(obj)
 }
 
+// ChannelModels 返回每个渠道当前生效的模型列表，与 /v1/models 同源
+// （含动态拉取与静态兜底），只包含已接入账号的渠道。
+// 供管理端（费率面板）复用，保证「模型列表」与「模型费率」基于同一份清单。
+func (h *Handler) ChannelModels() map[provider.Kind][]provider.ModelInfo {
+	out := make(map[provider.Kind][]provider.ModelInfo, len(h.cfg.Runtimes))
+	for _, k := range h.runtimeKinds() {
+		rt := h.cfg.Runtimes[k]
+		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 {
+			continue
+		}
+		infos := h.fetchRuntimeModels(rt)
+		if len(infos) == 0 {
+			infos = rt.StaticModels
+		}
+		out[k] = infos
+	}
+	return out
+}
+
+// InvalidateModels 清空各渠道的动态模型缓存，使下次读取重新拉取上游。
+// 新增账号后调用：否则新渠道/新模型要等 TTL 到期才出现。
+func (h *Handler) InvalidateModels() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	for _, rt := range h.cfg.Runtimes {
+		if rt == nil {
+			continue
+		}
+		rt.mu.Lock()
+		rt.models = nil
+		rt.fetched = time.Time{}
+		rt.lastFail = time.Time{}
+		rt.mu.Unlock()
+	}
+}
+
 func (h *Handler) runtimeKinds() []provider.Kind {
 	ks := make([]provider.Kind, 0, len(h.cfg.Runtimes))
 	for k := range h.cfg.Runtimes {
@@ -488,3 +543,6 @@ func WorkBuddyStaticModels() []provider.ModelInfo {
 func TraeWorkStaticModels() []provider.ModelInfo {
 	return append([]provider.ModelInfo{}, traeworkStaticModels...)
 }
+
+// WorkBuddyAIStaticModels 国际版静态模型表实际定义在 internal/workbuddyai 包，
+// 由 cmd 直接引用 workbuddyai.StaticModels()，此处不再重复。
