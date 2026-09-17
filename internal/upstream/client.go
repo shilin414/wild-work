@@ -84,6 +84,11 @@ type apiEnvelope struct {
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
 	HTTP *http.Client
+	// StreamHTTP 专供 SSE 流式请求（/v2/chat/completions）。
+	// 不设 Timeout：Go 的 http.Client.Timeout 覆盖「连接 + 重定向 + 读完响应体」，
+	// 会硬性掐断持续输出的长流（长任务 120s 即断）。与 traework 的 StreamHTTP 对齐。
+	// 为 nil 时回退到 HTTP。
+	StreamHTTP *http.Client
 	// BillingHTTP 供账单/签到接口使用（短超时，慢网络下避免面板操作长时间假死）。
 	// 为 nil 时回退到 HTTP。
 	BillingHTTP *http.Client
@@ -103,12 +108,21 @@ func New() *Client {
 	}
 	return &Client{
 		HTTP:            &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:      &http.Client{Transport: tr},
 		BillingHTTP:     &http.Client{Timeout: 30 * time.Second, Transport: tr},
 		ChatBaseCN:      "https://copilot.tencent.com",
 		BillingBaseCN:   "https://www.codebuddy.cn",
 		ChatBaseGlobal:  "https://www.workbuddy.ai",
 		BillingBaseGlob: "https://www.workbuddy.ai",
 	}
+}
+
+// streamClient 返回流式请求用的 HTTP 客户端（无整体超时）。
+func (c *Client) streamClient() *http.Client {
+	if c.StreamHTTP != nil {
+		return c.StreamHTTP
+	}
+	return c.HTTP
 }
 
 // billingClient 返回账单接口用的 HTTP 客户端。
@@ -227,7 +241,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	// 流式请求走无整体超时的客户端，避免长任务被 Client.Timeout 掐断。
+	resp, err := c.streamClient().Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
@@ -528,15 +543,23 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 	}
 	out := make([]provider.ModelPricing, 0, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		rate := parseCredits(m.Credits)
-		if rate <= 0 && m.ID != "auto" {
-			continue // hunyuan-chat 等非计费模型
+		// 判据是 credits 字段是否为空，而不是 rate 是否为 0：
+		//   - credits 为空  → 非计费模型（补全、本地自定义等），跳过
+		//   - credits="x0.00" → 限时免费模型（hy4-preview / hy3 等），必须保留
+		// 若按 rate<=0 过滤，限免模型会被整体丢掉，定价面板只剩带 -x 后缀的
+		// 计费版本（hy4-preview-x x0.29），造成"该模型不免费"的误判。
+		if strings.TrimSpace(m.Credits) == "" && m.ID != "auto" {
+			continue
 		}
+		rate := parseCredits(m.Credits)
 		note := ""
 		for _, tag := range m.Tags {
 			if strings.HasPrefix(tag, "badge:") {
 				note = strings.TrimPrefix(tag, "badge:")
 			}
+		}
+		if note == "" && rate == 0 && m.ID != "auto" {
+			note = "限时免费"
 		}
 		out = append(out, provider.ModelPricing{
 			Model:   m.ID,

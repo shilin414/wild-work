@@ -213,7 +213,10 @@ func (p *Pool) SetDisabled(uid string, d bool) {
 	p.saveLocked()
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
+// ReenableIfCredits 签到/保活后解冻：仅当 remain > 0 且账号未被禁用时恢复。
+//
+// 注意：这里的 !e.disabled 是硬边界 —— 停用账号照常签到、照常更新余额，
+// 但签到不会把它解冻回路由池。改动前请先确认是否真的要改变“停用”语义。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

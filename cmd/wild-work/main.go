@@ -105,6 +105,8 @@ func main() {
 		qdPool.Add(a)
 	}
 
+	// 注意：这里只覆盖非流式客户端。三个渠道的 SSE 流式请求各走独立的
+	// StreamHTTP（不设 Timeout），否则 Client.Timeout 会硬性掐断持续输出的长流。
 	wbUp := upstream.New()
 	wbUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	trUp := traework.New()
@@ -118,8 +120,9 @@ func main() {
 
 	wbSch := scheduler.New(scheduler.Config{Pool: wbPool, Upstream: wbUp, Name: "workbuddy", CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours})
 	trSch := scheduler.New(scheduler.Config{Pool: trPool, Upstream: trUp, Name: "traework", CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours})
-	// Qoder 无签到活动：调度器只做 token keepalive（每日 refresh 保活）
-	qdSch := scheduler.New(scheduler.Config{Pool: qdPool, Upstream: qdUp, Name: "qoder", CheckinMinutes: nil, KeepaliveHours: cfg.Schedule.KeepaliveHours})
+	// Qoder 无签到活动：调度器只做 token keepalive（每日 refresh 保活）。
+	// SkipCheckin 关闭签到，否则每轮都会给全部 qoder 账号记一条假失败。
+	qdSch := scheduler.New(scheduler.Config{Pool: qdPool, Upstream: qdUp, Name: "qoder", CheckinMinutes: nil, KeepaliveHours: cfg.Schedule.KeepaliveHours, SkipCheckin: true})
 
 	runtimes := map[provider.Kind]*server.Runtime{
 		provider.WorkBuddy: {Kind: provider.WorkBuddy, Pool: wbPool, Upstream: wbUp, StaticModels: server.WorkBuddyStaticModels()},

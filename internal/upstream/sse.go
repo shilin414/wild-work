@@ -217,6 +217,14 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 			if err == io.EOF {
 				break
 			}
+			// 异常结束（读超时/连接重置）：补一个 [DONE] 让客户端正常收尾，
+			// 否则客户端收到半截流会一直等待或直接判定失败。
+			if !sawDone {
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				if fl != nil {
+					fl.Flush()
+				}
+			}
 			return err
 		}
 	}

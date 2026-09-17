@@ -215,6 +215,12 @@ func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) error 
 		return nil
 	})
 	if err != nil {
+		// 异常结束（读超时/连接重置）：补一个 [DONE] 让客户端正常收尾，
+		// 否则客户端收到半截流会一直等待或直接判定失败。
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if flush != nil {
+			flush()
+		}
 		return err
 	}
 	if !sawDone {

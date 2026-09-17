@@ -26,6 +26,7 @@ type Config struct {
 	CheckinHours   []int  // 旧配置兼容，整点小时
 	CheckinMinutes []int  // 当天分钟数，优先于 CheckinHours
 	KeepaliveHours []int  // 默认 [22]
+	SkipCheckin    bool   // 渠道无签到活动（qoder）：不排签到，避免刷失败日志
 }
 
 // Scheduler 调度器。
@@ -244,6 +245,7 @@ func contains(hours []int, h int) bool {
 // CheckinResult 单账号签到结果（GUI 面板展示）。
 type CheckinResult struct {
 	UID       string `json:"uid"`
+	Nickname  string `json:"nickname,omitempty"`
 	OK        bool   `json:"ok"`
 	Msg       string `json:"msg"`
 	Remain    int64  `json:"remain"`
@@ -251,29 +253,31 @@ type CheckinResult struct {
 }
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
-// 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
+// 冷却与停用中的账号同样参与：签到只领积分，不会解除停用
+// （pool.ReenableIfCredits 要求 !disabled）；失败的账号只记录日志，不影响后续账号。
 func (s *Scheduler) RunCheckinNow() {
 	name := s.name()
-	log.Printf("checkin batch start platform=%s accounts=%d", name, len(s.cfg.Pool.List()))
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			log.Printf("checkin skip platform=%s uid=%s reason=disabled", name, st.UID)
-			continue
-		}
+	if s.cfg.SkipCheckin {
+		return
+	}
+	accounts := s.cfg.Pool.List()
+	log.Printf("checkin batch start platform=%s accounts=%d", name, len(accounts))
+	failed := 0
+	for _, st := range accounts {
 		r := s.checkinOne(st.UID)
 		log.Printf("checkin result platform=%s uid=%s ok=%t msg=%s remain=%d has_remain=%t", name, st.UID, r.OK, r.Msg, r.Remain, r.HasRemain)
+		if !r.OK {
+			failed++
+			log.Printf("CHECKIN_FAILED platform=%s uid=%s nickname=%s reason=%s", name, r.UID, r.Nickname, r.Msg)
+		}
 	}
-	log.Printf("checkin batch done platform=%s", name)
+	log.Printf("checkin batch done platform=%s total=%d ok=%d failed=%d", name, len(accounts), len(accounts)-failed, failed)
 }
 
-// CheckinAccount 单个账号立即签到（禁用跳过），返回该账号结果。
+// CheckinAccount 单个账号立即签到（停用/冷却同样参与），返回该账号结果。
 func (s *Scheduler) CheckinAccount(uid string) (CheckinResult, error) {
-	st, ok := s.cfg.Pool.Status(uid)
-	if !ok {
+	if _, ok := s.cfg.Pool.Status(uid); !ok {
 		return CheckinResult{}, fmt.Errorf("unknown account %s", uid)
-	}
-	if st.Disabled {
-		return CheckinResult{}, fmt.Errorf("account %s disabled", uid)
 	}
 	return s.checkinOne(uid), nil
 }
@@ -282,9 +286,13 @@ func (s *Scheduler) CheckinAccount(uid string) (CheckinResult, error) {
 func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	name := s.name()
 	log.Printf("checkin start platform=%s uid=%s", name, uid)
+	nickname := ""
+	if st, ok := s.cfg.Pool.Status(uid); ok {
+		nickname = st.Nickname
+	}
 	a := s.cfg.Pool.AuthByUID(uid)
 	if a == nil || a.RefreshToken == "" {
-		r := CheckinResult{UID: uid, Msg: "no refresh token"}
+		r := CheckinResult{UID: uid, Nickname: nickname, Msg: "no refresh token"}
 		s.cfg.Pool.RecordCheckin(uid, false, r.Msg)
 		s.notifyCheckin(r)
 		return r
@@ -292,13 +300,13 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	// 签到前保证 access token 有效；否则仅依赖晚间 keepalive 时，早上的签到可能拿过期 token。
 	if a.NeedsRefresh(2 * time.Hour) {
 		if err := s.refreshForCheckin(a, uid); err != nil {
-			r := CheckinResult{UID: uid, Msg: "refresh: " + shortErr(err)}
+			r := CheckinResult{UID: uid, Nickname: nickname, Msg: "refresh: " + shortErr(err)}
 			s.cfg.Pool.RecordCheckin(uid, false, r.Msg)
 			s.notifyCheckin(r)
 			return r
 		}
 	}
-	r := CheckinResult{UID: uid}
+	r := CheckinResult{UID: uid, Nickname: nickname}
 	checkinErr := s.cfg.Upstream.DailyCheckin(a)
 	// status 接口本身就是令牌有效性验证；若返回 session dead，刷新一次后重试整套签到。
 	if checkinErr != nil && isSessionDead(checkinErr) {
@@ -384,25 +392,26 @@ func isSessionDead(err error) bool {
 	return errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead
 }
 
-// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// RunKeepaliveNow 立即对所有账号刷新 token；停用的账号同样保活，
+// 否则它们的 token 会一路衰减到期。session 死亡的自动禁用。
 func (s *Scheduler) RunKeepaliveNow() {
 	name := s.name()
-	log.Printf("refresh batch start platform=%s", name)
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			log.Printf("refresh skip platform=%s uid=%s reason=disabled", name, st.UID)
-			continue
-		}
+	accounts := s.cfg.Pool.List()
+	log.Printf("refresh batch start platform=%s accounts=%d", name, len(accounts))
+	failed := 0
+	for _, st := range accounts {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			msg := "no refresh token"
-			log.Printf("refresh skip platform=%s uid=%s reason=%s", name, st.UID, msg)
+			failed++
+			log.Printf("KEEPALIVE_FAILED platform=%s uid=%s nickname=%s reason=%s", name, st.UID, st.Nickname, msg)
 			s.notifyRefresh(st.UID, false, msg)
 			continue
 		}
 		log.Printf("refresh start platform=%s uid=%s reason=keepalive", name, st.UID)
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("refresh failed platform=%s uid=%s err=%v", name, st.UID, err)
+			failed++
+			log.Printf("KEEPALIVE_FAILED platform=%s uid=%s nickname=%s reason=%v", name, st.UID, st.Nickname, err)
 			var ue *provider.Error
 			if errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead {
 				s.cfg.Pool.Disable(st.UID, "12153 session dead")
@@ -412,12 +421,13 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("refresh save failed platform=%s uid=%s err=%v", name, st.UID, err)
+			failed++
+			log.Printf("KEEPALIVE_FAILED platform=%s uid=%s nickname=%s reason=refresh save: %v", name, st.UID, st.Nickname, err)
 			s.notifyRefresh(st.UID, false, "refresh save: "+err.Error())
 			continue
 		}
 		log.Printf("refresh success platform=%s uid=%s expires_at=%d", name, st.UID, a.ExpiresAt)
 		s.notifyRefresh(st.UID, true, "ok")
 	}
-	log.Printf("refresh batch done platform=%s", name)
+	log.Printf("refresh batch done platform=%s total=%d ok=%d failed=%d", name, len(accounts), len(accounts)-failed, failed)
 }

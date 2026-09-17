@@ -20,6 +20,17 @@ temp/
 
 # 系统
 .DS_Store
-Thumbs.dbgithub_token.txt
+Thumbs.db
+github_token.txt
 HANDOFF.md
 GO多平台发布备忘.md
+
+# 本地运行时目录（bin/ 含 auths 凭证、config.json、exe 与全部备份副本，绝不入库）
+bin/
+
+# 本地运维工具（账号注入/审计脚本，私用不入库）
+tools/
+
+# 手工备份副本（*.bak、*.bak-YYYYMMDD-HHMMSS）
+*.bak
+*.bak-*

@@ -31,7 +31,7 @@ import (
 )
 
 // Version 版本号。
-const Version = "2.0.1"
+const Version = "2.0.2"
 
 const (
 	loginTimeout   = 5 * time.Minute
@@ -500,11 +500,8 @@ func (a *App) CheckinAll() []scheduler.CheckinResult {
 		if rt.Kind == provider.Qoder { // Qoder 无签到活动，跳过
 			continue
 		}
+		// 停用/冷却中的账号同样参与：签到只领积分，不会解除停用。
 		for _, st := range rt.Pool.List() {
-			if st.Disabled {
-				results = append(results, scheduler.CheckinResult{UID: st.UID, Msg: "账号已禁用"})
-				continue
-			}
 			res, err := rt.Scheduler.CheckinAccount(st.UID)
 			if err != nil {
 				res = scheduler.CheckinResult{UID: st.UID, Msg: err.Error()}
@@ -516,7 +513,9 @@ func (a *App) CheckinAll() []scheduler.CheckinResult {
 	for _, r := range results {
 		if r.OK {
 			ok++
+			continue
 		}
+		log.Printf("CHECKIN_FAILED uid=%s nickname=%s reason=%s", r.UID, r.Nickname, r.Msg)
 	}
 	log.Printf("批量签到完成：total=%d ok=%d failed=%d", len(results), ok, len(results)-ok)
 	return results

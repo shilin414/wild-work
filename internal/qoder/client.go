@@ -21,9 +21,14 @@ import (
 
 // Client QoderWork 上游客户端。
 type Client struct {
-	HTTP    *http.Client
-	Base    string // 业务 API，默认 https://openapi.qoder.com.cn
-	Gateway string // 推理网关，默认 https://gateway.qoder.com.cn
+	HTTP *http.Client
+	// StreamHTTP 专供 SSE 流式请求（gateway agent_chat_generation）。
+	// 不设 Timeout：Go 的 http.Client.Timeout 覆盖「连接 + 重定向 + 读完响应体」，
+	// 会硬性掐断持续输出的长流（实测长任务 120s 即断）。与 traework 对齐。
+	// 为 nil 时回退到 HTTP。
+	StreamHTTP *http.Client
+	Base       string // 业务 API，默认 https://openapi.qoder.com.cn
+	Gateway    string // 推理网关，默认 https://gateway.qoder.com.cn
 
 	// modelMap 客户端名（display_name 规范化）→ 上游 model key。
 	// 由 FetchModels 填充；ChatStream 优先查此表，查不到再查静态表。
@@ -50,10 +55,19 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Client{
-		HTTP:    &http.Client{Timeout: timeout, Transport: tr},
-		Base:    OpenAPIBase,
-		Gateway: GatewayBase,
+		HTTP:       &http.Client{Timeout: timeout, Transport: tr},
+		StreamHTTP: &http.Client{Transport: tr},
+		Base:       OpenAPIBase,
+		Gateway:    GatewayBase,
 	}
+}
+
+// streamClient 返回流式请求用的 HTTP 客户端（无整体超时）。
+func (c *Client) streamClient() *http.Client {
+	if c.StreamHTTP != nil {
+		return c.StreamHTTP
+	}
+	return c.HTTP
 }
 
 // NewWithBase 测试用：覆盖 base/gateway。
@@ -258,7 +272,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err := sess.ApplyHeaders(req, encoded, url, a.UID, true, modelKey); err != nil {
 		return nil, 0, nil, fmt.Errorf("cosy headers: %w", err)
 	}
-	resp, err := c.HTTP.Do(req)
+	// 流式请求走无整体超时的客户端，避免长任务被 Client.Timeout 掐断。
+	resp, err := c.streamClient().Do(req)
 	if err != nil {
 		log.Printf("qoder chat_stream uid=%s model=%s: transport error: %v", a.UID, modelKey, err)
 		return nil, 0, nil, err

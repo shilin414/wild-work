@@ -342,6 +342,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	reqStart := time.Now()
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := h.pickWithSticky(rt)
 		if acct == nil {
@@ -407,11 +408,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rt.Pool.NoteSuccess(acct.UID)
 		h.stickySuccess(rt)
 		if peek.Stream {
-			_ = rt.Upstream.Stream(w, rc)
+			// 响应头已发出，无法再改状态码；但错误必须记录并计入账号健康度，
+			// 否则流中断会完全静默（不记日志、不冷却、不换号）。
+			if serr := rt.Upstream.Stream(w, rc); serr != nil {
+				log.Printf("stream aborted platform=%s uid=%s model=%s elapsed=%s err=%v",
+					rt.Kind, acct.UID, model, time.Since(reqStart).Truncate(time.Millisecond), serr)
+				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				h.stickyClear(rt)
+			}
 			return
 		}
 		resp, err := rt.Upstream.Aggregate(rc)
 		if err != nil {
+			log.Printf("aggregate failed platform=%s uid=%s model=%s elapsed=%s err=%v",
+				rt.Kind, acct.UID, model, time.Since(reqStart).Truncate(time.Millisecond), err)
+			rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+			h.stickyClear(rt)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}

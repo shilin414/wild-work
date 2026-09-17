@@ -313,3 +313,99 @@ func TestCheckinAccountRecordsResult(t *testing.T) {
 		t.Error("want error for unknown uid")
 	}
 }
+
+func newTestScheduler(t *testing.T, f *fakeUpstream, p *pool.Pool) *Scheduler {
+	t.Helper()
+	srv := f.server()
+	t.Cleanup(srv.Close)
+	up := &upstream.Client{
+		HTTP:            srv.Client(),
+		ChatBaseCN:      srv.URL,
+		BillingBaseCN:   srv.URL,
+		ChatBaseGlobal:  srv.URL,
+		BillingBaseGlob: srv.URL,
+	}
+	return New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
+}
+
+// 停用账号同样参与签到，且签到不会把它解冻回路由池。
+func TestRunCheckinIncludesDisabledAccount(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetDisabled("u1", true)
+
+	s := newTestScheduler(t, f, p)
+	s.RunCheckinNow()
+
+	if f.checkinCalls.Load() != 1 {
+		t.Errorf("checkin calls=%d, want 1 (disabled account must still check in)", f.checkinCalls.Load())
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Error("checkin must not re-enable a disabled account")
+	}
+	if st.Credits != 500 {
+		t.Errorf("credits=%d want 500", st.Credits)
+	}
+	if !st.LastCheckinOK {
+		t.Errorf("last checkin should be recorded: %+v", st)
+	}
+}
+
+// 单账号签到入口同样不再拦截停用账号。
+func TestCheckinAccountAllowsDisabled(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 10}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetDisabled("u1", true)
+
+	s := newTestScheduler(t, f, p)
+	res, err := s.CheckinAccount("u1")
+	if err != nil {
+		t.Fatalf("disabled account should be allowed: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("res=%+v", res)
+	}
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Error("account must stay disabled")
+	}
+}
+
+// 保活覆盖停用账号：否则它们的 token 会一路衰减到期。
+func TestRunKeepaliveIncludesDisabledAccount(t *testing.T) {
+	f := &fakeUpstream{}
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
+	p.Add(a)
+	p.SetDisabled("u1", true)
+
+	s := newTestScheduler(t, f, p)
+	s.RunKeepaliveNow()
+
+	if f.refreshCalls.Load() != 1 {
+		t.Errorf("refresh calls=%d, want 1 (disabled account must stay alive)", f.refreshCalls.Load())
+	}
+	if a.AccessToken != "new" {
+		t.Errorf("token not refreshed: %s", a.AccessToken)
+	}
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Error("keepalive must not re-enable a disabled account")
+	}
+}
+
+// 无签到活动的渠道（qoder）跳过整批，不产生失败记录。
+func TestRunCheckinSkipsWhenNoCheckinActivity(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, SkipCheckin: true})
+	s.RunCheckinNow()
+	if f.checkinCalls.Load() != 0 {
+		t.Errorf("checkin calls=%d, want 0", f.checkinCalls.Load())
+	}
+}

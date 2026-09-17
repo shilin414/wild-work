@@ -372,7 +372,14 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 
 	for {
 		line, err := br.ReadString('\n')
-		if err != nil && err != io.EOF {
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			// 异常结束（连接重置等）：补 [DONE] 让客户端正常收尾，与其他渠道一致。
+			if !sawDone {
+				_ = writeDONE()
+			}
 			return err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
