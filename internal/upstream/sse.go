@@ -557,6 +557,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	sawDone := false // 上游是否已显式发过 [DONE]（异常收尾时据此决定是否补发）
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -565,6 +566,7 @@ readLoop:
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
+			sawDone = true
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
