@@ -1,9 +1,48 @@
 # wild-work v2.2.1 — 积分显示修正：可用/不可用拆分 + 有效期 + 明细翻页 + 401 自愈
 
 > 本版聚焦「积分到底有多少能用」这一件事，修正 TraeWork 可用余额虚高与面板数字误导，
-> 并解决「本地 token 看似有效但上游已拒绝」导致的积分恒 0。
+> 解决「本地 token 看似有效但上游已拒绝」导致的积分恒 0，
+> 并补齐面板的映射编辑与浮窗翻页体验。
 
 ## 修复
+
+### API 配置对话框「映射表-编辑」无效 + 保存链路损坏（重要）
+
+**现象**：点「编辑」无任何反应；就算改了映射/渠道/密钥，点保存也永远失败。
+
+**根因**（三层叠加）：
+
+1. `btnCompatMap` 从未绑定 onclick；
+2. `serveLocked` 先 `net.Listen` 新地址再关闭旧 listener——同端口保存时撞自身
+   （`Only one usage of each socket address`）→ `listen` 恒 400，
+   **映射/渠道/密钥修改从未真正保存成功过**；
+3. 映射编辑用的是 `prompt()`，语法错误只能弹窗循环。
+
+**修复**：
+
+- 同地址直接复用现有 listener；切地址先关闭旧服务再绑定（`App.listenAddr` 跟踪）；
+- 对话框内嵌映射编辑器，就地校验（缺 `=`、目标非 `channel/model`、未知渠道、重复键），
+  错误红字显示在编辑器下方，不再弹窗循环；
+- **缺省建议按钮**：按已接入渠道给出可点选的映射起点（如
+  `Claude Code → workbuddy: claude-* = workbuddy/glm-5.2`），
+  一键插入并去重；未绑定渠道不显示建议，避免误导；
+- **compat 热更新**：原实现路由表只在启动时加载一次，运行中改映射要重启才生效
+  （这正是「有的机器没配映射也能用」的原因——config.json 启动时已带映射）。
+  现面板保存后经 `gateway.SetCompat` 立即生效；
+- 客户端请求路由到无账号渠道时，错误信息区分「未绑定账号」与「全部冷却/禁用」，
+  引导用户去面板添加账号或换已接入渠道。
+
+**映射写法**（已验证 CC/Codex 可正常使用）：
+
+```
+claude-* = workbuddy/glm-5.2          # CC 主模型
+claude-sonnet-* = workbuddy/kimi-k2.7 # 更长前缀优先，盖过 claude-*
+codex-* = traework/DeepSeek-V4-Pro    # Codex
+gpt-5* = traework/glm-5.2            # gpt-5 / gpt-5.1 / gpt-5-codex 均命中
+```
+
+注意：未命中映射的裸名走 `default_channel` + 原始模型名（如 `workbuddy/gpt-4.1`），
+上游多半无此模型会报错，需自行补映射。
 
 ### 本地 token 看似有效、上游已拒绝 → 永久卡在 401（重要）
 
@@ -88,7 +127,10 @@ traework refresh success uid=1096660468371514 refresh_rotated=true expires_at=17
 
 ### 面板：明细分页与有效期列
 
-- 每页 8 条，底部 `‹ 1 / 4 ›` 翻页；翻页只重绘不重新请求（响应已缓存）
+- 每页 8 条，翻页器在浮窗**顶部居中**（`‹ 1 / 4 ›`），标题/条数分列两端；
+  鼠标从卡片到达按钮路径最短，不跨出浮窗边界
+- 浮窗宽度固定 380px，翻页时不再变形/宽度跳动；单元格超长省略号
+- 翻页只重绘不重新请求（响应已缓存）
 - 新增「有效期」列（仅当上游确实下发到期时间时出现）
 - 明细缓存随 `loadState()` 失效，避免刷新后 tooltip 仍显示旧余额
 - 限额为 0 的包（如 TraeWork 的免费 0 限额包）不再出现在明细里
@@ -120,6 +162,7 @@ v2.2.0 的 `state-*.json` 无 `unusable` 字段，直接换二进制会让卡片
 - `pool.ReenableIfCredits(uid, remain, unusable)` 签名变更；`SetCredits` 并入 `SetCreditDetail`
 - 积分刷新路径改走 `UserResourceDetail` 单次请求，同时拿到可用余额与小计（原先只调 `UserResource`）
 - 三渠道 `UserResourceDetail` 增加 `Usable: true`（国内版/国际版/Qoder 无端点分区）
+- gateway 增加 `SetCompat`（路由表热更新，带 RWMutex）与 `App.SetCompatSyncer` 注入点
 - CI：tag 发版的 release note 改用仓库内 `RELEASE-<tag>.md`（缺失时回退自动生成）
 
 ## 升级说明

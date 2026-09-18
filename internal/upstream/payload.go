@@ -31,6 +31,11 @@ func prepareBodyInner(src []byte) []byte {
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj) // developer → system（上游对 developer 角色触发内容过滤误杀）
+	// 出站脱敏（全改写完成后、Marshal 前）：剥离上游内容审核黑名单指纹
+	// （Claude Code / Codex CLI 注入的模板句、billing header、11128 等，见 sanitize.go）。
+	if msgs, ok := obj["messages"].([]any); ok {
+		sanitizeMessages(msgs)
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,10 +43,9 @@ var webFS embed.FS
 var trayIconICO []byte
 
 func main() {
-	// 工作目录固定为 exe 所在目录，保证相对路径配置（./auths ./data）稳定
-	if exe, err := os.Executable(); err == nil {
-		_ = os.Chdir(filepath.Dir(exe))
-	}
+	// 工作目录：便携/CLI 形态固定为 exe 所在目录，保证相对路径配置（./auths ./data）稳定。
+	// macOS .app bundle 内该目录只读、且随 app 替换被清空，故改用系统数据目录（见 workDir）。
+	_ = os.Chdir(workDir())
 
 	cfgPath := "config.json"
 	cfg, err := config.Load(cfgPath)
@@ -212,6 +212,10 @@ func main() {
 		},
 		MaxTokensCap: cfg.Compat.MaxTokensCap,
 	})
+	// 面板保存 compat 时热更新兼容层路由表（不然新映射要重启才生效）
+	appInst.SetCompatSyncer(func(defaultChannel string, maxTokensCap int, modelMap map[string]string) {
+		compat.SetCompat(defaultChannel, maxTokensCap, modelMap, channels)
+	})
 	mux := http.NewServeMux()
 	compat.Routes(mux) // POST /v1/responses · /v1/messages · /v1/messages/count_tokens
 	mux.Handle("/", inner)
@@ -304,6 +308,35 @@ func main() {
 			},
 		})
 	}()
+}
+
+// workDir 解析数据目录（config.json / auths/ / data/ 的落点）。
+//
+//   - WILDWORK_HOME 显式指定时优先（测试/自定义布局用）；
+//   - 运行在 macOS .app bundle 内（.../Xxx.app/Contents/MacOS）时改用
+//     ~/Library/Application Support/WildWork：bundle 内容对普通用户只读，
+//     且写到包内会在替换/升级 app 时连同账号一起丢失；
+//   - 其余形态（CLI 二进制、Windows 便携包、Linux）沿用 exe 所在目录。
+func workDir() string {
+	if v := os.Getenv("WILDWORK_HOME"); v != "" {
+		if err := os.MkdirAll(v, 0o755); err == nil {
+			return v
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	dir := filepath.Dir(exe)
+	if strings.Contains(dir, ".app/Contents/MacOS") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p := filepath.Join(home, "Library", "Application Support", "WildWork")
+			if err := os.MkdirAll(p, 0o755); err == nil {
+				return p
+			}
+		}
+	}
+	return dir
 }
 
 func displayHost(cfg *config.Config) string {

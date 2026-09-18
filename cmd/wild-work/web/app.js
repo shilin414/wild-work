@@ -77,6 +77,7 @@ const DETAIL_PAGE_SIZE = 8;
 let detailTimer = null;
 let detailCache = {};
 // detailState 当前 tooltip 的展示状态：{uid, page}。
+// detailState 当前 tooltip 的展示状态：{uid, page}。
 let detailState = null;
 
 async function showCreditDetail(e, uid) {
@@ -133,7 +134,17 @@ function renderCreditDetail() {
   // 避免一列全空或把「无到期信息」误读成「永不过期」。
   const hasExpiry = items.some((it) => it.expire_at);
 
-  let html = `<div class="detail-head">积分明细 <span class="detail-count">共 ${items.length} 条</span></div>`;
+  // 头部：翻页器在顶部居中，标题与条数分列两端（用户方案：翻页不跨出浮窗）。
+  let html = `<div class="detail-head">`;
+  html += `<span class="detail-count">共 ${items.length} 条</span>`;
+  if (pages > 1) {
+    html += `<span class="detail-pager">`;
+    html += `<span class="detail-pg${page === 0 ? " off" : ""}" data-pg="${page - 1}">‹</span>`;
+    html += `<span class="detail-pg-info">${page + 1} / ${pages}</span>`;
+    html += `<span class="detail-pg${page >= pages - 1 ? " off" : ""}" data-pg="${page + 1}">›</span>`;
+    html += `</span>`;
+  }
+  html += `<span class="detail-title">积分明细</span></div>`;
   html += `<table class="detail-table"><thead><tr><th>套餐</th><th>总额</th><th>已用</th><th>剩余</th>`;
   if (hasExpiry) html += `<th>有效期</th>`;
   html += `</tr></thead><tbody>`;
@@ -154,22 +165,15 @@ function renderCreditDetail() {
   html += `<span>可用 <b>${usable}</b></span>`;
   if (unusable > 0) html += `<span class="detail-sum-unusable">不可用 <b>${unusable}</b></span>`;
   html += `</div>`;
-
-  if (pages > 1) {
-    html += `<div class="detail-pager">`;
-    html += `<span class="detail-pg${page === 0 ? " off" : ""}" data-pg="${page - 1}">‹</span>`;
-    html += `<span class="detail-pg-info">${page + 1} / ${pages}</span>`;
-    html += `<span class="detail-pg${page >= pages - 1 ? " off" : ""}" data-pg="${page + 1}">›</span>`;
-    html += `</div>`;
-  }
   tip.innerHTML = html;
   tip.style.display = "block";
 
-  // 翻页：只改状态重绘，不重新请求接口。
+  // 翻页：只改状态重绘，不重新请求接口。事件重挂由 hideCreditDetail 统一负责。
   tip.querySelectorAll(".detail-pg").forEach((btn) => {
     if (btn.classList.contains("off")) return;
     btn.onclick = (ev) => {
       ev.stopPropagation();
+      if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; } // 翻页即取消关闭
       const target = Number(btn.dataset.pg);
       if (Number.isFinite(target)) { detailState.page = target; renderCreditDetail(); }
     };
@@ -180,7 +184,7 @@ function hideCreditDetail() {
   detailTimer = setTimeout(() => {
     const tip = $("creditTip");
     if (tip) tip.style.display = "none";
-  }, 200);
+  }, 300);
   const tip = $("creditTip");
   if (tip) {
     tip.onmouseenter = () => { if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; } };
@@ -597,11 +601,78 @@ function openApiConfig() {
   const map = cc.model_map || {};
   const entries = Object.entries(map);
   $("mapSummary").textContent = entries.length === 0 ? "（空）" : entries.map(([k,v]) => `${k} → ${v}`).join("\u00A0 \u00A0");
+  // 映射编辑器：随对话框打开而重置为当前值，收起
+  $("mapText").value = entries.map(([k,v]) => `${k} = ${v}`).join("\n");
+  $("mapEditor").classList.add("hidden");
+  $("mapErr").textContent = "";
+  renderMapPresets(channels);
   $("apiConfigOverlay").classList.remove("hidden");
 }
 
 function closeApiConfig() {
   $("apiConfigOverlay").classList.add("hidden");
+}
+
+// ---------- 模型映射编辑器 ----------
+
+// CHANNEL_PRESETS 各渠道的缺省建议映射（模型为该渠道常用/免费模型）。
+// 用途：未绑定某渠道账号、或不知道该渠道有哪些模型时，给出可点选的起点。
+const CHANNEL_PRESETS = {
+  workbuddy:   { label: "Claude Code → workbuddy",  items: ["claude-* = workbuddy/glm-5.2", "claude-sonnet-* = workbuddy/kimi-k2.7"] },
+  traework:    { label: "Codex → traework",          items: ["gpt-5* = traework/glm-5.2", "codex-* = traework/DeepSeek-V4-Pro"] },
+  workbuddyai: { label: "Claude Code → workbuddyai", items: ["claude-* = workbuddyai/deepseek-v4.1-flash"] },
+  qoder:       { label: "→ qoder",                   items: ["gpt-* = qoder/glm-5.2"] },
+};
+
+// renderMapPresets 按当前已接入渠道渲染缺省建议按钮。
+// 仅列出「已接入（有账号）」的渠道——未绑定的渠道点了也会因无账号而失败，不给误导性入口。
+function renderMapPresets(channels) {
+  const bound = new Set((state.accounts || []).map(a => a.group));
+  const box = $("mapPresets");
+  box.innerHTML = channels.filter(c => CHANNEL_PRESETS[c] && bound.has(c)).map(c => {
+    const p = CHANNEL_PRESETS[c];
+    return `<span class="btn tiny preset" data-ch="${c}" title="${esc(p.items.join("\n"))}">${esc(p.label)}</span>`;
+  }).join(" ") || `<span class="hint">（尚未接入任何渠道，先在账号管理添加账号）</span>`;
+  box.querySelectorAll(".preset").forEach(b => {
+    b.onclick = () => {
+      const p = CHANNEL_PRESETS[b.dataset.ch];
+      // 追加尚未存在的行，避免重复插入
+      const cur = $("mapText").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const have = new Set(cur.map(l => l.split("=")[0].trim()));
+      const add = p.items.filter(it => !have.has(it.split("=")[0].trim()));
+      if (!add.length) { toast(`${p.label} 的建议映射已存在`); return; }
+      $("mapText").value = cur.concat(add).join("\n");
+    };
+  });
+}
+
+// toggleMapEditor 展开/收起映射编辑器。
+function toggleMapEditor() {
+  $("mapEditor").classList.toggle("hidden");
+}
+
+// parseMapText 校验编辑器内容，返回 (modelMap, 错误信息)。
+// 语法错误就地提示并阻断保存，不再弹 prompt 循环。
+function parseMapText(raw) {
+  const map = {};
+  const channels = new Set(state.compat?.channels || []);
+  for (const line0 of raw.split(/\r?\n/)) {
+    const line = line0.trim();
+    if (!line || line.startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx < 0) return [null, `格式错误（缺少 =）：${line}`];
+    const k = line.substring(0, idx).trim(), v = line.substring(idx + 1).trim();
+    if (!k || !v) return [null, `格式错误（键或值为空）：${line}`];
+    const vi = v.indexOf("/");
+    if (vi <= 0 || !v.substring(vi + 1).trim()) return [null, `映射目标必须是「渠道/模型」形式：${v}`];
+    const ch = v.substring(0, vi);
+    if (channels.size && !channels.has(ch)) {
+      return [null, `未知渠道「${ch}」；已知渠道：${[...channels].join(", ")}`];
+    }
+    if (map[k] !== undefined) return [null, `重复的键：${k}`];
+    map[k] = v;
+  }
+  return [map, ""];
 }
 
 async function saveApiConfig() {
@@ -612,20 +683,16 @@ async function saveApiConfig() {
     await api("/api/config/listen", { host, port });
   } catch (e) { toast(e.message); return; }
 
+  // 映射：优先读编辑器；编辑器从未展开过则用原值（保证「只改监听/渠道不碰映射」）
+  let modelMap = state.compat?.model_map || {};
+  if (!$("mapEditor").classList.contains("hidden")) {
+    const [parsed, err] = parseMapText($("mapText").value);
+    if (err) { $("mapErr").textContent = err; toast(err); return; }
+    modelMap = parsed;
+  }
+
   const defaultChannel = $("selCh").value;
   const maxTokensCap = parseInt($("inMaxTok").value, 10) || 0;
-  const raw = prompt("模型名映射（一行一条，格式：客户端名 = channel/model）\n支持通配：claude-* = workbuddy/glm-5.2",
-    Object.entries(state.compat?.model_map || {}).map(([k,v]) => `${k} = ${v}`).join("\n"));
-  if (raw === null) { closeApiConfig(); return; } // 用户取消
-  const modelMap = {};
-  for (const line of raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
-    if (line.startsWith("#")) continue;
-    const idx = line.indexOf("=");
-    if (idx < 0) { toast(`格式错误：${line}`); return; }
-    const k = line.substring(0, idx).trim(), v = line.substring(idx+1).trim();
-    if (!k || !v) { toast(`格式错误：${line}`); return; }
-    modelMap[k] = v;
-  }
   try {
     await api("/api/config/compat", { default_channel: defaultChannel, max_tokens_cap: maxTokensCap, model_map: modelMap });
     toast("模型路由已更新");
@@ -729,6 +796,7 @@ function bind() {
 
   $("btnApiSave").onclick = saveApiConfig;
   $("btnApiCancel").onclick = closeApiConfig;
+  $("btnCompatMap").onclick = toggleMapEditor;
   $("selHost").onchange = () => {
     $("customHostRow").classList.toggle("hidden", $("selHost").value !== "__custom__");
   };

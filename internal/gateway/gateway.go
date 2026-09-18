@@ -12,6 +12,7 @@ package gateway
 import (
 	"encoding/json"
 	"log"
+	"sync"
 	"net/http"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type Gateway struct {
 	apiKeySource func() string // 非 nil 时优先于 apiKey（面板热改 Key 后立即跟随）
 	router       Router
 	maxTokensCap int
+	mu           sync.RWMutex // 保护 router/maxTokensCap 热更新
 }
 
 // New 构造兼容层。inner 为 nil 时返回 nil（调用方据此跳过兼容层，保持旧行为）。
@@ -58,6 +60,30 @@ func (g *Gateway) SetAPIKeySource(fn func() string) {
 	if g != nil {
 		g.apiKeySource = fn
 	}
+}
+
+// withRouter 在读锁内执行 fn（Router 指针语义，不可拷贝）。
+func (g *Gateway) withRouter(fn func(rt *Router)) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	fn(&g.router)
+}
+
+// SetCompat 热更新路由配置（default_channel / max_tokens_cap / model_map）。
+// 面板保存 compat 时调用；不刷新的话新映射要到下次重启才生效。
+// channels 用于校验映射目标的渠道前缀，调用方应传入当前已接入渠道。
+func (g *Gateway) SetCompat(defaultChannel string, maxTokensCap int, modelMap map[string]string, channels []string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.router = Router{
+		Default:  defaultChannel,
+		Map:      modelMap,
+		Channels: SortChannels(channels),
+	}
+	g.maxTokensCap = maxTokensCap
+	g.mu.Unlock()
 }
 
 // key 返回当前生效的 API Key。
@@ -168,12 +194,16 @@ func parseJSONBody(w http.ResponseWriter, r *http.Request, anthropicShape bool) 
 
 // resolveModel 解析模型名，失败时按协议形状回错误。
 func (g *Gateway) resolveModel(w http.ResponseWriter, model string, anthropicShape bool) (string, bool) {
-	resolved, err := g.router.Resolve(model)
-	if err != nil {
+	var resolved string
+	var rerr error
+	g.withRouter(func(rt *Router) {
+		resolved, rerr = rt.Resolve(model)
+	})
+	if rerr != nil {
 		if anthropicShape {
-			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", rerr.Error())
 		} else {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_model", err.Error())
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_model", rerr.Error())
 		}
 		return "", false
 	}

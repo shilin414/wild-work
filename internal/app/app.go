@@ -63,8 +63,9 @@ type App struct {
 	handler  *server.Handler // 内层（保留强类型，用于 SetAPIKey/ChannelModels 等）
 	httpRoot http.Handler    // 对外暴露的根 handler，可能为外层兼容层 mux（见 SetRootHandler）
 
-	mu      sync.Mutex // 保护 httpSrv / cfg 修改
-	httpSrv *http.Server
+	mu         sync.Mutex // 保护 httpSrv / cfg 修改
+	httpSrv    *http.Server
+	listenAddr string // 当前监听地址；同地址重复 serve 直接复用，避免自撞端口
 
 	muLogin      sync.Mutex
 	loginBusy    bool
@@ -76,6 +77,10 @@ type App struct {
 	pricingFP    string
 
 	logFile *os.File
+
+	// compatSyncer 面板保存 compat 后同步给外层兼容层（热更新路由表）。
+	// 由 main.go 注入；nil 时仅写配置不热更（下次启动生效）。
+	compatSyncer func(defaultChannel string, maxTokensCap int, modelMap map[string]string)
 
 	refreshMu  sync.Mutex // 防并发刷新积分
 	refreshing bool
@@ -234,6 +239,18 @@ func (a *App) StartServer() error {
 
 // serveLocked 在 newAddr 上启动新服务并切换；调用方需持有 a.mu。
 func (a *App) serveLocked(addr string) error {
+	// 地址未变时直接复用现有 listener：否则「先 Listen 再 Shutdown 旧」在同端口上
+	// 会撞自身（Only one usage of each socket address），导致面板保存映射/密钥时报 400。
+	if a.httpSrv != nil && a.listenAddr == addr {
+		return nil
+	}
+	// 先停旧服务再绑新地址：避免同端口切换时新旧 listener 短暂重叠报「端口被占用」。
+	if old := a.httpSrv; old != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = old.Shutdown(shutdownCtx)
+		cancel()
+		a.httpSrv = nil
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -242,18 +259,13 @@ func (a *App) serveLocked(addr string) error {
 		Handler:           a.serveHandler(),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	old := a.httpSrv
 	a.httpSrv = srv
+	a.listenAddr = addr
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("http serve %s: %v", addr, err)
 		}
 	}()
-	if old != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = old.Shutdown(shutdownCtx)
-	}
 	return nil
 }
 
@@ -262,6 +274,7 @@ func (a *App) Stop() {
 	a.mu.Lock()
 	srv := a.httpSrv
 	a.httpSrv = nil
+	a.listenAddr = ""
 	a.mu.Unlock()
 	if srv != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1011,9 +1024,18 @@ func (a *App) SetCompat(defaultChannel string, maxTokensCap int, modelMap map[st
 	if err != nil {
 		return err
 	}
+	// 热更新外层兼容层的路由表：不同步的话新映射要重启才生效。
+	if a.compatSyncer != nil {
+		a.compatSyncer(defaultChannel, maxTokensCap, modelMap)
+	}
 	log.Printf("模型名路由配置已更新：default_channel=%q max_tokens_cap=%d model_map=%d 条",
 		defaultChannel, maxTokensCap, len(modelMap))
 	return nil
+}
+
+// SetCompatSyncer 注入 compat 热更新回调（由 main.go 注入，指向 gateway.SetCompat）。
+func (a *App) SetCompatSyncer(fn func(defaultChannel string, maxTokensCap int, modelMap map[string]string)) {
+	a.compatSyncer = fn
 }
 
 // LoginBusy 是否登录中。

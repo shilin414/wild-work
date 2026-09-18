@@ -156,6 +156,14 @@
         <span class="btn small" id="btnCompatMap">编辑</span>
         <span class="hint" id="mapSummary" style="margin-left:6px"></span>
       </div>
+      <div id="mapEditor" class="map-editor hidden">
+        <div class="hint" style="margin-bottom:4px">一行一条，格式：<code>客户端模型名 = 渠道/模型名</code>；支持通配 <code>claude-* = workbuddy/glm-5.2</code>；以 # 开头为注释。</div>
+        <textarea id="mapText" class="input map-text" spellcheck="false" rows="6"></textarea>
+        <div class="hint" style="margin-top:5px">
+          缺省建议（点击插入）：<span id="mapPresets"></span>
+        </div>
+        <div class="hint" id="mapErr" style="color:var(--danger);margin-top:4px"></div>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn small" id="btnApiCancel">取消</button>
