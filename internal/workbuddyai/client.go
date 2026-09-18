@@ -4,10 +4,12 @@ package workbuddyai
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -25,12 +27,17 @@ type Client struct {
 // New 生产默认。配置连接池减少 TLS 握手。
 func New() *Client { return NewWithTimeout(120 * time.Second) }
 
-// NewWithTimeout 指定上游超时。
+// NewWithTimeout 指定上游超时。Transport 与 CN 同构：禁 h2 + Dial/keepalive/TLS 握手 + ResponseHeaderTimeout。
 func NewWithTimeout(timeout time.Duration) *Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:           dialer.DialContext,
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 	}
 	return &Client{
 		HTTP: &http.Client{Timeout: timeout, Transport: tr},
@@ -70,7 +77,7 @@ func commonHeaders(req *http.Request) {
 func chatHeaders(req *http.Request, a *auth.Auth) {
 	commonHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	} else {
@@ -87,7 +94,7 @@ func chatHeaders(req *http.Request, a *auth.Auth) {
 
 // billingHeaders 余额 / 签到接口头。
 func billingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	if a.UID != "" {
@@ -101,6 +108,7 @@ func billingHeaders(req *http.Request, a *auth.Auth) {
 }
 
 // refreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+// refreshHeaders refresh 端点专属头。调用方必须持有 a.Lock()，本函数直接读 RefreshToken。
 func refreshHeaders(req *http.Request, a *auth.Auth) {
 	commonHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
@@ -108,7 +116,7 @@ func refreshHeaders(req *http.Request, a *auth.Auth) {
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
-	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +284,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			MaxTokens:     m.MaxOutputTokens,
 			// 目录接口真实返回的容量
 			ContextFromAPI: true,
+			// 能力：直接透传上游声明（不自行纠正上游与实际不符的情况）
+			SupportsImages:    m.imageOK(),
+			SupportsReasoning: m.SupportsReasoning,
+			SupportsTools:     m.SupportsToolCall,
 		})
 	}
 	// 硬编码补入目录外可用模型
@@ -339,6 +351,11 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 	return c.userResource(a)
 }
 
+// softRateResetLoc 上游墙钟时间口径：固定按 UTC+8 解释。
+// 上游下发的 CycleEndTime 等时间串均为国内时区墙钟，用 time.Local 解析会在
+// 非 UTC+8 机器上把到期日算错一天。
+var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+
 // userResource 单次请求同时产出总额与明细。
 func (c *Client) userResource(a *auth.Auth) (int64, []provider.ResourceItem, error) {
 	now := time.Now()
@@ -370,6 +387,8 @@ func (c *Client) userResource(a *auth.Auth) (int64, []provider.ResourceItem, err
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+					// CycleEndTime 到期时间（"2006-01-02 15:04:05"，UTC+8 墙钟）。
+					CycleEndTime string `json:"CycleEndTime"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
@@ -395,13 +414,27 @@ func (c *Client) userResource(a *auth.Auth) (int64, []provider.ResourceItem, err
 		}
 		total += remain
 		items = append(items, provider.ResourceItem{
-			Name:   acct.PackageName,
-			Total:  tot,
-			Used:   used,
-			Remain: remain,
+			Name:     acct.PackageName,
+			Total:    tot,
+			Used:     used,
+			Remain:   remain,
+			ExpireAt: expireDate(acct.CycleEndTime),
+			Usable:   true, // 国际版无端点分区，所有套餐均可被本工具消耗
 		})
 	}
 	return total, items, nil
+}
+
+// expireDate 把上游墙钟时间串（UTC+8）转为 YYYY-MM-DD；缺失/不可解析时返回空串。
+func expireDate(ts string) string {
+	ts = strings.TrimSpace(ts)
+	if ts == "" {
+		return ""
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, softRateResetLoc); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return ""
 }
 
 // DailyCheckin 国际版的「每日活跃」任务：用免费模型对话一次保持账号活跃，
@@ -491,7 +524,7 @@ func (c *Client) pokeActivity(a *auth.Auth) {
 func (c *Client) Classify(status int, body string) provider.ErrKind { return Classify(status, body) }
 
 // Stream 实现 provider.Upstream（国际版已是 OpenAI SSE，直接透传）。
-func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error { return Stream(w, r) }
+func (c *Client) Stream(w http.ResponseWriter, r io.Reader, model string) error { return Stream(w, r) }
 
 // Aggregate 实现 provider.Upstream。
-func (c *Client) Aggregate(r io.Reader) (map[string]any, error) { return Aggregate(r) }
+func (c *Client) Aggregate(r io.Reader, model string) (map[string]any, error) { return Aggregate(r) }

@@ -192,7 +192,11 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// SetAPIKey 运行时修改内层 API Key（面板可调用）。
 func (h *Handler) SetAPIKey(key string) { h.apiMu.Lock(); defer h.apiMu.Unlock(); h.cfg.APIKey = key }
+
+// CurrentAPIKey 读取当前生效的 API Key（供外层兼容层跟随面板修改）。
+func (h *Handler) CurrentAPIKey() string { return h.currentAPIKey() }
 func (h *Handler) currentAPIKey() string {
 	h.apiMu.RLock()
 	defer h.apiMu.RUnlock()
@@ -212,6 +216,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
 }
 
+// 静态兜底表无上游能力数据，故不声明能力。
 var workbuddyStaticModels = []provider.ModelInfo{
 	{ID: "glm-5.2", ContextWindow: 131072}, {ID: "glm-5.1", ContextWindow: 131072}, {ID: "glm-5v-turbo", ContextWindow: 131072},
 	{ID: "kimi-k2.7", ContextWindow: 131072}, {ID: "minimax-m3", ContextWindow: 131072}, {ID: "hy3", ContextWindow: 131072},
@@ -219,6 +224,7 @@ var workbuddyStaticModels = []provider.ModelInfo{
 	{ID: "deepseek-v4-pro", ContextWindow: 131072}, {ID: "deepseek-v4-flash", ContextWindow: 131072},
 }
 
+// traework 静态兜底表同样无上游能力数据，不声明能力。
 var traeworkStaticModels = []provider.ModelInfo{
 	{ID: "glm-5.2"}, {ID: "glm-5-turbo"}, {ID: "glm-5"}, {ID: "DeepSeek-V4-Pro"}, {ID: "DeepSeek-V4-Flash"},
 	{ID: "kimi-k2.6"}, {ID: "kimi-k2.7-code"}, {ID: "minimax-m3"}, {ID: "qwen3-coder"}, {ID: "Doubao-Seed-2.1-Pro"},
@@ -253,18 +259,30 @@ func (h *Handler) modelList() []map[string]any {
 			infos = rt.StaticModels
 		}
 		for _, mi := range infos {
-			id := k.String() + "/" + mi.ID
-			entry := map[string]any{"id": id, "object": "model", "created": 1753600000, "owned_by": k.String()}
-			if mi.ContextWindow > 0 {
-				entry["context_length"] = mi.ContextWindow
-			}
-			if mi.MaxTokens > 0 {
-				entry["max_output_tokens"] = mi.MaxTokens
-			}
-			out = append(out, entry)
+			out = append(out, buildModelEntry(k, mi))
 		}
 	}
 	return out
+}
+
+// buildModelEntry 构造单条 /v1/models 条目。
+// OpenAI 官方仅规定 id/object/created/owned_by，未定义能力字段；
+// 多模态能力按 OpenRouter / llama.cpp 通行的 architecture.input_modalities 透传。
+// 上游模型列表接口未返回能力信息时，按惯例回退为 ["text"]。
+func buildModelEntry(k provider.Kind, mi provider.ModelInfo) map[string]any {
+	id := k.String() + "/" + mi.ID
+	entry := map[string]any{"id": id, "object": "model", "created": 1753600000, "owned_by": k.String()}
+	if mi.ContextWindow > 0 {
+		entry["context_length"] = mi.ContextWindow
+	}
+	if mi.MaxTokens > 0 {
+		entry["max_output_tokens"] = mi.MaxTokens
+	}
+	entry["architecture"] = map[string]any{
+		"input_modalities": mi.InputModalities(),
+		"modality":         mi.Modality(),
+	}
+	return entry
 }
 
 func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
@@ -341,6 +359,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_model", err.Error())
 		return
 	}
+	clientModel := peek.Model // 客户端请求的原始模型名（含 channel/ 前缀），回填进响应
 	body, err = rewriteModel(body, model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -402,6 +421,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rt.Pool.Disable(acct.UID, "session dead")
 			case provider.ErrNotFound:
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+			case provider.ErrContentBlocked, provider.ErrPromptTooLong:
+				// 内容拦截/上下文超限：不冷却不熔断不计错，直接透传原文回客户端。
+				// 这些是请求内容问题，与账号健康无关，轮转白费时间且浪费好号配额。
+				transparentError(w, status, respBody)
+				return
+			case provider.ErrWafBlock, provider.ErrAccountFault, provider.ErrModelBlocked:
+				// 账号级风控/故障/模型不存在：软冷却，不累计错误计数。
+				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, kind.String())
+				transparentError(w, status, respBody)
+				return
 			case provider.ErrServer:
 				if rt.NoCooldownOnServerError {
 					// 该渠道声明 5xx 为上游网关抖动（账号本身健康），
@@ -426,7 +455,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 响应头已发出，无法再改状态码；但错误必须记录并计入账号健康度，
 			// 否则流中断会完全静默（不记日志、不冷却、不换号）。
-			if serr := rt.Upstream.Stream(w, rc); serr != nil {
+			if serr := rt.Upstream.Stream(w, rc, clientModel); serr != nil {
 				log.Printf("stream aborted platform=%s uid=%s model=%s elapsed=%s err=%v",
 					rt.Kind, acct.UID, model, time.Since(reqStart).Truncate(time.Millisecond), serr)
 				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
@@ -434,7 +463,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		resp, err := rt.Upstream.Aggregate(rc)
+		resp, err := rt.Upstream.Aggregate(rc, clientModel)
 		if err != nil {
 			log.Printf("aggregate failed platform=%s uid=%s model=%s elapsed=%s err=%v",
 				rt.Kind, acct.UID, model, time.Since(reqStart).Truncate(time.Millisecond), err)
@@ -535,6 +564,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": "api_error", "code": code}})
+}
+
+// transparentError 上游错误原文透传：status+body 原样写回，不包装。
+func transparentError(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func WorkBuddyStaticModels() []provider.ModelInfo {

@@ -33,6 +33,11 @@ const (
 	ErrNotFound                   // 404 上游偶发 → 短冷却不累计 errCount
 	ErrServer                     // 5xx 上游故障
 	ErrClient                     // 其他 4xx / 业务错误
+	ErrContentBlocked             // 内容策略拦截（400 + 审核文案）→ 不罚账号，透传原文
+	ErrPromptTooLong              // 11115 上下文超限 → 请求级错误，不罚号不轮转，透传原文
+	ErrWafBlock                   // 403 + 非业务信封（WAF 拦截页/空体）→ 账号软冷却
+	ErrAccountFault               // 账号级授权/配额故障（11140/14017）→ 冷却轮换
+	ErrModelBlocked               // 11102 该后端无此模型 → (账号,模型) 负缓存避让
 )
 
 func (k ErrKind) String() string {
@@ -49,6 +54,16 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrContentBlocked:
+		return "content_blocked"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
+	case ErrWafBlock:
+		return "waf_block"
+	case ErrAccountFault:
+		return "account_fault"
+	case ErrModelBlocked:
+		return "model_blocked"
 	default:
 		return "none"
 	}
@@ -75,6 +90,29 @@ type ModelInfo struct {
 	// false 表示是硬编码估算/占位（如渠道不返回该字段），
 	// 消费方（面板/API）不应把估值当作真实容量展示。
 	ContextFromAPI bool
+	// 以下能力字段均为「已确认为 true」才置 true；数据缺失时保持 false（未知）。
+	// 未知与「明确不支持」在语义上不同，但对消费方（/v1/models 声明、UI 图标）
+	// 的处理一致：不声明该能力。需要区分时由各渠道自行记录来源。
+	SupportsImages    bool // 支持图像输入（多模态视觉）
+	SupportsReasoning bool // 支持思考/推理模式
+	SupportsTools     bool // 支持函数/工具调用
+}
+
+// InputModalities 按 OpenAI 生态惯例给出输入模态列表（OpenRouter/llama.cpp 的
+// architecture.input_modalities 语义）。不支持图像时只返回 ["text"]。
+func (m ModelInfo) InputModalities() []string {
+	if m.SupportsImages {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
+}
+
+// Modality 返回 OpenRouter 风格的 modality 描述串（如 "text+image->text"）。
+func (m ModelInfo) Modality() string {
+	if m.SupportsImages {
+		return "text+image->text"
+	}
+	return "text->text"
 }
 
 // ModelPricing 模型积分定价（从上游 API 拉取）。
@@ -104,11 +142,18 @@ type Upstream interface {
 	FetchModels(a *auth.Auth) ([]ModelInfo, error)
 	FetchModelPricing(a *auth.Auth) ([]ModelPricing, error)
 	UserResource(a *auth.Auth) (int64, error)
+	// UserResourceDetail 返回可消耗余额 + 明细条目（含到期时间与可用性标记）。
+	// 返回的 remain 口径与 UserResource 一致，均为「本工具可消耗」的余额，
+	// 不得包含不可用池——否则 pool 会按虚高余额选号。
 	UserResourceDetail(a *auth.Auth) (int64, []ResourceItem, error)
 	DailyCheckin(a *auth.Auth) error
 	Classify(status int, body string) ErrKind
-	Stream(w http.ResponseWriter, r io.Reader) error
-	Aggregate(r io.Reader) (map[string]any, error)
+
+	// Stream/Aggregate 的 model 参数是「客户端请求的原始模型名」（含 channel/ 前缀），
+	// 由调用方显式传入而非渠道内部记忆状态——后者在多账号并发下会串号。
+	// 实现方应在输出的 model 字段回填该值（上游常返回 "auto" 或裸名）。
+	Stream(w http.ResponseWriter, r io.Reader, model string) error
+	Aggregate(r io.Reader, model string) (map[string]any, error)
 }
 
 // ResourceItem 积分明细条目。
@@ -117,4 +162,26 @@ type ResourceItem struct {
 	Total  int64  `json:"total"`
 	Used   int64  `json:"used"`
 	Remain int64  `json:"remain"`
+
+	// ExpireAt 该条目到期时刻（RFC3339，UTC+8 墙钟）。空串表示上游未下发到期时间，
+	// 前端据此隐藏「有效期」列——不得用零值时间冒充「永不过期」。
+	ExpireAt string `json:"expire_at,omitempty"`
+	// Usable 标记该条目是否属于本工具可消耗的额度池。
+	// TraeWork 存在按 available_endpoint 划分的专用池（ep=1，官方客户端专用），
+	// 本工具走的是 ep=0；这类额度对用户是「看得见用不了」，需在界面上分开统计。
+	// 注意：零值为 false，故各渠道构造时须显式置位；渠道无此概念时统一填 true。
+	Usable bool `json:"usable"`
+}
+
+// Summarize 按 Usable 标记汇总条目：返回 (可消耗剩余, 不可消耗剩余)。
+// 供 app 层统一填充 ResourceDetail 接口的两个小计字段，避免多处各写一份循环。
+func Summarize(items []ResourceItem) (usable, unusable int64) {
+	for _, it := range items {
+		if it.Usable {
+			usable += it.Remain
+		} else {
+			unusable += it.Remain
+		}
+	}
+	return usable, unusable
 }

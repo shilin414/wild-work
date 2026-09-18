@@ -19,5 +19,13 @@
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+  "compat": {
+    "default_channel": "workbuddy",
+    "max_tokens_cap": 32000,
+    "model_map": {
+      "claude-*": "workbuddy/glm-5.2",
+      "gpt-5*": "workbuddy/deepseek-v4-pro"
+    }
   }
 }

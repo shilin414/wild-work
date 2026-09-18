@@ -53,6 +53,20 @@ func (a *Auth) JWT() string {
 	return a.AccessToken
 }
 
+// AccessTokenValue 锁内快照：出站请求头用，防止与 keepalive 刷新并发读写 token。
+func (a *Auth) AccessTokenValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.AccessToken
+}
+
+// RefreshTokenValue 锁内快照：防止调度器锁外直读 RefreshToken 与 refresh 写回竞争。
+func (a *Auth) RefreshTokenValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.RefreshToken
+}
+
 // NeedsRefreshLocked 是 NeedsRefresh 的持锁内部版本；调用方必须已持有读/写锁。
 func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
 	if a.ExpiresAt <= 0 {

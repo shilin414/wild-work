@@ -111,6 +111,18 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 默认 120
 	} `json:"upstream"`
 
+	// Compat 三接口兼容层（OpenAI Responses / Anthropic Messages）配置。
+	// 零值即关闭模型名映射，仅接受 "channel/model" 形式。
+	Compat struct {
+		// DefaultChannel 无前缀模型名的傅底渠道，如 "workbuddy"。
+		DefaultChannel string `json:"default_channel"`
+		// ModelMap 裸模型名 → "channel/model"。key 以 * 结尾时按前缀通配匹配。
+		ModelMap map[string]string `json:"model_map"`
+		// MaxTokensCap 转发上游前对 max_tokens 封顶（0 = 不限制）。
+		// Anthropic 客户端常发 64000，而多数上游上限更低，导致直接 400。
+		MaxTokensCap int `json:"max_tokens_cap"`
+	} `json:"compat"`
+
 	// 解析后
 	HardCreditDur  time.Duration `json:"-"`
 	SoftRateDur    time.Duration `json:"-"`
@@ -134,6 +146,8 @@ func Default() *Config {
 	c.Schedule.CheckinTimes = []string{"09:00", "21:00"}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Upstream.TimeoutSeconds = 120
+	c.Compat.DefaultChannel = "workbuddy"
+	c.Compat.MaxTokensCap = 32000
 	return c
 }
 
@@ -261,6 +275,14 @@ func applyEnv(c *Config) {
 			c.Upstream.TimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WILDWORK_DEFAULT_CHANNEL"); v != "" {
+		c.Compat.DefaultChannel = v
+	}
+	if v := os.Getenv("WILDWORK_MAX_TOKENS_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Compat.MaxTokensCap = n
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -279,6 +301,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+	}
+	if c.Compat.MaxTokensCap < 0 {
+		c.Compat.MaxTokensCap = 0 // 负数视为「不限制」，避免误用导致 max_tokens 被置 0
 	}
 	if c.Listen.Port <= 0 {
 		c.Listen.Port = 7863

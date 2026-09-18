@@ -39,9 +39,17 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID            string    `json:"uid"`
-	Nickname       string    `json:"nickname,omitempty"`
-	Credits        int64     `json:"credits"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	// Credits 本工具可消耗的积分余额（pool 路由依据）。
+	Credits int64 `json:"credits"`
+	// UnusableCredits 账号名下有、但本工具用不了的积分（如 TraeWork 的 ep=1 专用池）。
+	// 仅用于面板展示，不参与路由；0 表示该渠道不区分或没有此类额度。
+	UnusableCredits int64 `json:"unusable_credits,omitempty"`
+	// CreditsStale 标记余额口径不可信：state 文件是旧版本格式（无 unusable 字段）
+	// 或尚未完成首次成功刷新。UI 应显示「待刷新」而非把旧值/0 当真值。
+	// 自动刷新循环首次成功写入后即清除。
+	CreditsStale   bool      `json:"credits_stale,omitempty"`
 	Cooling        bool      `json:"cooling"`
 	Until          time.Time `json:"until,omitempty"`
 	Reason         string    `json:"reason,omitempty"`
@@ -55,10 +63,14 @@ type Status struct {
 type entry struct {
 	a        *auth.Auth
 	credits  int64
-	disabled bool
-	reason   string
-	until    time.Time
-	errCount int
+	unusable int64
+	// creditsStale 余额口径不可信（旧版 state 或从未成功刷新过）。
+	// 仅影响面板展示，不参与 Pick() 路由。
+	creditsStale bool
+	disabled     bool
+	reason       string
+	until        time.Time
+	errCount     int
 
 	lastCheckinOK  bool
 	lastCheckinAt  time.Time
@@ -76,18 +88,26 @@ func (e *entry) healthy(now time.Time) bool {
 }
 
 // stateFile 持久化格式。
+// version 用于识别旧版本状态文件：v2.2.0 及之前无 unusable 字段，
+// 读入后这些账号的余额口径不可信（pool 会置 creditsStale）。
+// 缺失/零值视为 1（保持向后兼容：老文件不报错）。
+type stateFile struct {
+	Version  int                     `json:"version,omitempty"`
+	Accounts map[string]accountState `json:"accounts"`
+}
+
+// stateVersion 当前状态文件格式版本。v2: 引入 unusable（可用/不可用拆分）。
+const stateVersion = 2
+
 type accountState struct {
 	Credits        int64     `json:"credits"`
+	Unusable       int64     `json:"unusable,omitempty"`
 	Disabled       bool      `json:"disabled"`
 	Reason         string    `json:"reason,omitempty"`
 	Until          time.Time `json:"until,omitempty"`
 	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
 	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
 	LastCheckinMsg string    `json:"last_checkin_msg,omitempty"`
-}
-
-type stateFile struct {
-	Accounts map[string]accountState `json:"accounts"`
 }
 
 // Pool 账号池。
@@ -165,12 +185,16 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	return best.a
 }
 
-// SetCredits 更新账号余额。
-func (p *Pool) SetCredits(uid string, credits int64) {
+// SetCreditDetail 更新账号积分：usable 为可消耗余额（Pick() 排序依据），
+// unusable 为账号名下有但本工具用不了的额度（如 TraeWork 的 ep=1 专用池），仅面板展示。
+// 写入即视为余额口径可信，清除 creditsStale。
+func (p *Pool) SetCreditDetail(uid string, usable, unusable int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.credits = credits
+		e.credits = usable
+		e.unusable = unusable
+		e.creditsStale = false
 	}
 	p.saveLocked()
 }
@@ -214,14 +238,17 @@ func (p *Pool) SetDisabled(uid string, d bool) {
 }
 
 // ReenableIfCredits 签到/保活后解冻：仅当 remain > 0 且账号未被禁用时恢复。
+// unusable 为不可消耗额度小计（仅面板展示）。写入即视为余额口径可信。
 //
 // 注意：这里的 !e.disabled 是硬边界 —— 停用账号照常签到、照常更新余额，
 // 但签到不会把它解冻回路由池。改动前请先确认是否真的要改变“停用”语义。
-func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+func (p *Pool) ReenableIfCredits(uid string, remain, unusable int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = remain
+		e.unusable = unusable
+		e.creditsStale = false
 		if remain > 0 && !e.disabled {
 			e.until = time.Time{}
 			e.reason = ""
@@ -315,17 +342,19 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	return Status{
-		UID:            uid,
-		Nickname:       e.a.Nickname,
-		Credits:        e.credits,
-		Cooling:        !e.until.IsZero() && now.Before(e.until),
-		Until:          e.until,
-		Reason:         e.reason,
-		Disabled:       e.disabled,
-		ErrCount:       e.errCount,
-		LastCheckinOK:  e.lastCheckinOK,
-		LastCheckinAt:  e.lastCheckinAt,
-		LastCheckinMsg: e.lastCheckinMsg,
+		UID:             uid,
+		Nickname:        e.a.Nickname,
+		Credits:         e.credits,
+		UnusableCredits: e.unusable,
+		CreditsStale:    e.creditsStale,
+		Cooling:         !e.until.IsZero() && now.Before(e.until),
+		Until:           e.until,
+		Reason:          e.reason,
+		Disabled:        e.disabled,
+		ErrCount:        e.errCount,
+		LastCheckinOK:   e.lastCheckinOK,
+		LastCheckinAt:   e.lastCheckinAt,
+		LastCheckinMsg:  e.lastCheckinMsg,
 	}
 }
 
@@ -342,10 +371,16 @@ func (p *Pool) load() {
 	if json.Unmarshal(raw, &sf) != nil {
 		return
 	}
+	// 旧格式（v2.2.0 及之前）无 unusable 字段：余额口径与新版不一致（可用/不可用拆分），
+	// 读入后置 creditsStale，待自动刷新循环首刷时重算并清除。
+	// 新文件带 version>=2，且带 unusable 字段才视为可信。
+	stale := sf.Version < stateVersion
 	for uid, s := range sf.Accounts {
 		p.byUID[uid] = &entry{
 			a:              &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:        s.Credits,
+			unusable:       s.Unusable,
+			creditsStale:   stale,
 			disabled:       s.Disabled,
 			reason:         s.Reason,
 			until:          s.Until,
@@ -360,10 +395,11 @@ func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
 	}
-	sf := stateFile{Accounts: map[string]accountState{}}
+	sf := stateFile{Version: stateVersion, Accounts: map[string]accountState{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = accountState{
 			Credits:        e.credits,
+			Unusable:       e.unusable,
 			Disabled:       e.disabled,
 			Reason:         e.reason,
 			Until:          e.until,

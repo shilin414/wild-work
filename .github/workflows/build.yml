@@ -108,7 +108,17 @@ jobs:
           # tag 触发 → 创建新正式 release（不会碰其他分支的 release）
           if [[ "${{ github.event_name }}" == "push" ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
-            gh release create "$TAG" release-assets/* --generate-notes
+            # release note 用仓库里的 RELEASE-<tag>.md（手写摘要），而非 --generate-notes
+            # （后者只给 commit 链接列表，没有面向用户的变更摘要）；
+            # 找不到该文件时回退到 --generate-notes，不阻塞发版。
+            NOTES="RELEASE-${TAG}.md"
+            if [[ -f "$NOTES" ]]; then
+              echo "=== 使用 $NOTES 作为 release note ==="
+              gh release create "$TAG" release-assets/* --title "$TAG" --notes-file "$NOTES"
+            else
+              echo "=== 未找到 $NOTES，回退到自动生成 notes ==="
+              gh release create "$TAG" release-assets/* --generate-notes
+            fi
             exit 0
           fi
           # workflow_dispatch → 每次更新同一个 dev-build 专属 release

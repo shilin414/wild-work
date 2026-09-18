@@ -6,10 +6,17 @@ package upstream
 import (
 	"encoding/json"
 	"strings"
+
+	"wild-work/internal/sanitize"
 )
 
 // PrepareBody 单 pass 改写；无法解析时原样返回。
 func PrepareBody(src []byte) []byte {
+	return sanitize.Messages(prepareBodyInner(src))
+}
+
+// prepareBodyInner 同 PrepareBody 但不含脱敏（供内部调用）。
+func prepareBodyInner(src []byte) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -18,6 +25,10 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	obj["stream"] = true
+	translateMaxCompletionTokens(obj)
+	if _, has := obj["stream_options"]; !has {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj) // developer → system（上游对 developer 角色触发内容过滤误杀）
 	out, err := json.Marshal(obj)
@@ -25,6 +36,33 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	return out
+}
+
+// translateMaxCompletionTokens OpenAI 别名 max_completion_tokens → max_tokens。
+// 显式 max_tokens 优先（别名只删不译）；非正数值不翻译；翻译后删别名。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens")
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return
+	}
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
 }
 
 // normalizeRoles 将 OpenAI 的 developer 角色改写为 system。

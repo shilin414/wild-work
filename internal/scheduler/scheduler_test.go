@@ -69,7 +69,7 @@ func (f *fakeUpstream) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing,
 }
 
 func (f *fakeUpstream) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
-	return 0, nil, nil
+	return f.resourceRemain, []provider.ResourceItem{{Name: "套餐", Remain: f.resourceRemain, Usable: true}}, nil
 }
 
 func (f *fakeUpstream) server() *httptest.Server {

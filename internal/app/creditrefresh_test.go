@@ -20,9 +20,17 @@ type fakeUpstream struct {
 	resourceCalls atomic.Int32
 	remain        int64
 	failResource  atomic.Bool
+	// sessionDead 为 true 时 UserResourceDetail 先报一次 401（模拟本地 token 已失效），
+	// 刷新后恢复——用于验证「401 自愈」。
+	sessionDead  atomic.Bool
+	refreshCalls atomic.Int32
 }
 
-func (f *fakeUpstream) RefreshToken(a *auth.Auth) error { return nil }
+func (f *fakeUpstream) RefreshToken(a *auth.Auth) error {
+	f.refreshCalls.Add(1)
+	f.sessionDead.Store(false) // 刷新即恢复
+	return nil
+}
 
 func (f *fakeUpstream) ChatStream(a *auth.Auth, body []byte) (io.ReadCloser, int, []byte, error) {
 	return nil, 200, nil, nil
@@ -42,8 +50,17 @@ func (f *fakeUpstream) UserResource(a *auth.Auth) (int64, error) {
 	return f.remain, nil
 }
 
+// UserResourceDetail 与 UserResource 同源：remain 即可用余额，unusable 固定 0。
+// 计入 resourceCalls，因为生产代码的刷新路径只走 Detail（不再调 UserResource）。
 func (f *fakeUpstream) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
-	return 0, nil, nil
+	f.resourceCalls.Add(1)
+	if f.sessionDead.Load() {
+		return 0, nil, &provider.Error{Kind: provider.ErrSessionDead, Status: 401, Msg: "token invalid"}
+	}
+	if f.failResource.Load() {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	return f.remain, []provider.ResourceItem{{Name: "套餐", Remain: f.remain, Usable: true}}, nil
 }
 
 func (f *fakeUpstream) DailyCheckin(a *auth.Auth) error { return nil }
@@ -52,9 +69,9 @@ func (f *fakeUpstream) Classify(status int, body string) provider.ErrKind {
 	return provider.ErrNone
 }
 
-func (f *fakeUpstream) Stream(w http.ResponseWriter, r io.Reader) error { return nil }
+func (f *fakeUpstream) Stream(w http.ResponseWriter, r io.Reader, model string) error { return nil }
 
-func (f *fakeUpstream) Aggregate(r io.Reader) (map[string]any, error) { return nil, nil }
+func (f *fakeUpstream) Aggregate(r io.Reader, model string) (map[string]any, error) { return nil, nil }
 
 // newTestApp 构造仅含单个渠道的最小 App。
 func newTestApp(t *testing.T, kind provider.Kind, up provider.Upstream, uid string) (*App, *pool.Pool) {
@@ -343,5 +360,71 @@ func TestBuildFeesChannelsCarriesColor(t *testing.T) {
 	}
 	if rows[0].Note != "独家优惠" || rows[0].Color != "#FF0000" {
 		t.Errorf("颜色未正确透传: note=%q color=%q", rows[0].Note, rows[0].Color)
+	}
+}
+
+// TestCreditRefreshSelfHealsSessionDead 本地 token 已失效（上游 401）时，
+// 刷新路径必须自动 refresh + 重试，而不是把积分永久记成 0。
+// 背景：NeedsRefresh 只比本地 expiresAt，token 在别处被轮换或上次未落盘时
+// 本地仍显示有效 → 不重试就永久卡死（面板恒为 0、明细恒为空）。
+func TestCreditRefreshSelfHealsSessionDead(t *testing.T) {
+	up := &fakeUpstream{remain: 1828}
+	up.sessionDead.Store(true)
+	a, p := newTestApp(t, provider.TraeWork, up, "uid-dead")
+
+	// 先确保池里账号带 refresh token（否则不会尝试刷新）
+	if au := p.AuthByUID("uid-dead"); au != nil {
+		au.RefreshToken = "rt"
+	}
+
+	got, err := a.RefreshCredits("uid-dead")
+	if err != nil {
+		t.Fatalf("RefreshCredits 应自愈，却报错: %v", err)
+	}
+	if got != 1828 {
+		t.Errorf("remain=%d want 1828（刷新后应拿到真实余额）", got)
+	}
+	if up.refreshCalls.Load() == 0 {
+		t.Error("未尝试 refresh，说明 401 未被识别为 session dead")
+	}
+	if st, _ := p.Status("uid-dead"); st.Credits != 1828 {
+		t.Errorf("池内积分=%d want 1828", st.Credits)
+	}
+}
+
+// TestResourceDetailSelfHealsSessionDead 明细接口同样要能自愈，
+// 否则前端 hover 永远拿不到 items（tooltip 不显示）。
+func TestResourceDetailSelfHealsSessionDead(t *testing.T) {
+	up := &fakeUpstream{remain: 4400}
+	up.sessionDead.Store(true)
+	a, p := newTestApp(t, provider.TraeWork, up, "uid-tip")
+	if au := p.AuthByUID("uid-tip"); au != nil {
+		au.RefreshToken = "rt"
+	}
+
+	remain, items, err := a.ResourceDetail("uid-tip")
+	if err != nil {
+		t.Fatalf("ResourceDetail 应自愈，却报错: %v", err)
+	}
+	if remain != 4400 || len(items) == 0 {
+		t.Errorf("remain=%d items=%d，刷新后应拿到真实明细", remain, len(items))
+	}
+}
+
+// TestResourceDetailNoRefreshTokenStillErrors 没有 refresh token 时不假装成功，
+// 仍返回错误让前端提示——避免静默显示错误的 0。
+func TestResourceDetailNoRefreshTokenStillErrors(t *testing.T) {
+	up := &fakeUpstream{remain: 100}
+	up.sessionDead.Store(true)
+	a, p := newTestApp(t, provider.TraeWork, up, "uid-nort")
+	if au := p.AuthByUID("uid-nort"); au != nil {
+		au.RefreshToken = ""
+	}
+
+	if _, _, err := a.ResourceDetail("uid-nort"); err == nil {
+		t.Error("无 refresh token 时应报错，而不是静默返回空")
+	}
+	if up.refreshCalls.Load() != 0 {
+		t.Error("无 refresh token 时不应尝试刷新")
 	}
 }

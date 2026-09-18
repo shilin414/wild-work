@@ -58,6 +58,7 @@ var brokenModels = map[string]bool{
 }
 
 // extraModels 目录接口不返回、但实测可用的模型，硬编码补进 /models 列表。
+// 注意：这些模型无上游能力数据，故不声明任何能力（见 /v1/models 的透传原则）。
 var extraModels = []provider.ModelInfo{
 	{ID: "deepseek-v4.1-flash", Name: "Deepseek-V4.1-Flash", ContextWindow: 1_000_000, MaxTokens: 128_000},
 	{ID: "hy4-preview-f", Name: "Hy4 preview F", ContextWindow: 1_000_000, MaxTokens: 64_000},

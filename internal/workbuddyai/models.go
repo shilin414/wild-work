@@ -17,6 +17,8 @@ import (
 )
 
 // catalogModel 目录原始模型条目。
+// 能力字段来自上游实测返回：supportsImages/supportsReasoning/supportsToolCall
+// 与 disabledMultimodal（true 表示上游显式关闭多模态）。
 type catalogModel struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
@@ -25,6 +27,17 @@ type catalogModel struct {
 	MaxOutputTokens int64    `json:"maxOutputTokens"`
 	Disabled        bool     `json:"disabled"`
 	Tags            []string `json:"tags"`
+
+	SupportsImages     bool `json:"supportsImages"`
+	SupportsReasoning  bool `json:"supportsReasoning"`
+	SupportsToolCall   bool `json:"supportsToolCall"`
+	DisabledMultimodal bool `json:"disabledMultimodal"`
+}
+
+// imageOK 判定该模型可否接收图像输入：
+// 上游显式声明 supportsImages 且未被 disabledMultimodal 关闭。
+func (m catalogModel) imageOK() bool {
+	return m.SupportsImages && !m.DisabledMultimodal
 }
 
 // catalogResp 目录响应（只取所需字段）。
@@ -315,17 +328,23 @@ func Classify(status int, body string) provider.ErrKind {
 		return provider.ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return provider.ErrHardCredit
-		}
-	}
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
 			return provider.ErrSessionDead
 		}
 	}
+	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
+		return provider.ErrSoftRate
+	}
+	for _, m := range hardMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return provider.ErrHardCredit
+		}
+	}
+	// 非 429 但 body 含限流文案 → 软限流
+	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "usage limit") || strings.Contains(lower, "请求过于频繁") {
 		return provider.ErrSoftRate
 	}
 	if status == http.StatusNotFound {
@@ -335,6 +354,21 @@ func Classify(status int, body string) provider.ErrKind {
 		return provider.ErrServer
 	}
 	if status >= 400 {
+		if strings.Contains(lower, "blocked by security policy") ||
+			strings.Contains(lower, "unapproved channel") ||
+			strings.Contains(lower, "illegal api invocation") {
+			return provider.ErrContentBlocked
+		}
+		if (status == 400 || status == 404) &&
+			(strings.Contains(lower, "prompt is too long") || strings.Contains(lower, "11115")) {
+			return provider.ErrPromptTooLong
+		}
+		if status == 403 && strings.TrimSpace(body) == "" {
+			return provider.ErrWafBlock
+		}
+		if strings.Contains(lower, "request illegal") || strings.Contains(lower, "trial not activated") {
+			return provider.ErrAccountFault
+		}
 		return provider.ErrClient
 	}
 	return provider.ErrNone

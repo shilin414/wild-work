@@ -94,8 +94,17 @@ body {
 .acct-card .acct-name { font-weight: 600; font-size: 14px; }
 .acct-card .acct-uid { font-size: 11px; color: var(--muted); }
 .acct-card .acct-mid { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.acct-card .acct-credits { font-size: 18px; font-weight: 700; cursor: pointer; }
+.acct-card .acct-credits { font-size: 18px; font-weight: 700; cursor: pointer; white-space: nowrap; }
 .acct-card .acct-credits span { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 2px; }
+/* 可用/不可用拆分：不可用额度降级为次要色，避免被当成可用余额。 */
+.acct-card .acct-credits .credit-sep { margin: 0 3px; color: var(--border); }
+.acct-card .acct-credits .credit-unusable { font-size: 15px; font-weight: 600; color: var(--muted); }
+/* 旧版 state 文件读入后余额口径不可信：显示待刷新而非旧值 */
+.acct-card .acct-credits .credit-stale {
+  font-size: 13px; font-weight: 600; color: var(--muted);
+  animation: stale-pulse 1.6s ease-in-out infinite;
+}
+@keyframes stale-pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 .acct-card .acct-checkin { font-size: 11px; }
 .acct-card .acct-ops { display: flex; gap: 4px; justify-content: flex-end; }
 
@@ -179,6 +188,13 @@ body {
   border: 1px dashed var(--border); cursor: help;
 }
 .fees .rate-note { color: #d97706; font-size: 11px; }
+/* 能力图标：模型 ID 后的小标记，hover 显示文字说明（title） */
+.fees .cap-icons { display: inline-flex; gap: 2px; margin-left: 2px; vertical-align: middle; }
+.fees .cap-icon {
+  display: inline-block; font-size: 11px; line-height: 1;
+  opacity: .75; cursor: help; filter: saturate(.85);
+}
+.fees .cap-icon:hover { opacity: 1; }
 
 /* 配置说明 */
 .docs { font-size: 13px; }
@@ -210,12 +226,39 @@ body {
   background: var(--card); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 10px 12px;
   box-shadow: 0 4px 16px rgba(0,0,0,.15); font-size: 12px;
-  min-width: 260px;
+  min-width: 300px; max-width: 420px;
 }
+.credit-tip .detail-head { font-weight: 600; margin-bottom: 6px; }
+.credit-tip .detail-count { font-weight: 400; color: var(--muted); font-size: 11px; margin-left: 4px; }
 .detail-table { width: 100%; border-collapse: collapse; }
-.detail-table th, .detail-table td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--border); }
+.detail-table th, .detail-table td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 .detail-table th { color: var(--muted); font-weight: 500; font-size: 11px; }
+.detail-table td:nth-child(2), .detail-table td:nth-child(3), .detail-table td:nth-child(4) { text-align: right; }
 .detail-table td:last-child { font-weight: 600; }
+/* 不可用额度整行淡显 + 角标 */
+.detail-table tr.detail-unusable { color: var(--muted); }
+.detail-tag {
+  font-size: 10px; padding: 1px 5px; margin-left: 5px; border-radius: 8px;
+  background: #f0f2f5; color: var(--muted);
+}
+.detail-sum {
+  display: flex; gap: 14px; margin-top: 7px; padding-top: 6px;
+  border-top: 1px solid var(--border); color: var(--muted);
+}
+.detail-sum b { color: var(--text); font-weight: 600; }
+.detail-sum-unusable b { color: var(--muted); }
+.detail-pager {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  margin-top: 6px; user-select: none;
+}
+.detail-pg {
+  cursor: pointer; padding: 1px 9px; border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text); line-height: 1.5;
+}
+.detail-pg:hover { background: #f0f2f5; }
+.detail-pg.off { opacity: .35; cursor: default; }
+.detail-pg.off:hover { background: transparent; }
+.detail-pg-info { color: var(--muted); font-size: 11px; }
 
 .footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }
 

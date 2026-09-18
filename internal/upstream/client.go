@@ -4,10 +4,12 @@ package upstream
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -20,13 +22,18 @@ import (
 type ErrKind = provider.ErrKind
 
 const (
-	ErrNone        = provider.ErrNone        // 成功
-	ErrHardCredit  = provider.ErrHardCredit  // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate    = provider.ErrSoftRate    // 429 软限流 → 短冷却
-	ErrSessionDead = provider.ErrSessionDead // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound    = provider.ErrNotFound    // 404 上游偶发 → 短冷却不累计 errCount（防雪崩）
-	ErrServer      = provider.ErrServer      // 5xx 上游故障
-	ErrClient      = provider.ErrClient      // 其他 4xx / 业务错误
+	ErrNone           = provider.ErrNone           // 成功
+	ErrHardCredit     = provider.ErrHardCredit     // 余额/权益不足 → 长冷却
+	ErrSoftRate       = provider.ErrSoftRate       // 429 软限流 → 短冷却
+	ErrSessionDead    = provider.ErrSessionDead    // 登录态失效 → 禁用
+	ErrNotFound       = provider.ErrNotFound       // 404 上游偶发 → 短冷却不累计 errCount
+	ErrServer         = provider.ErrServer         // 5xx 上游故障
+	ErrClient         = provider.ErrClient         // 其他 4xx / 业务错误
+	ErrContentBlocked  = provider.ErrContentBlocked // 内容拦截
+	ErrPromptTooLong   = provider.ErrPromptTooLong  // 上下文超限
+	ErrWafBlock        = provider.ErrWafBlock       // WAF 拦截
+	ErrAccountFault    = provider.ErrAccountFault   // 账号级故障
+	ErrModelBlocked    = provider.ErrModelBlocked   // 模型不存在
 )
 
 // Error 带分类的上游错误。
@@ -43,22 +50,37 @@ var hardMarkers = []string{
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
+// 内容拦截 marker（小写子串匹配）。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+// Classify 按 HTTP 状态码 + body 判定错误类别。
+// 429 必须在 hardMarkers 之前——限流 body 高频带 "quota exceeded"，先判 hardRule 会误归 12h 硬冷却。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
-	}
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
 		}
 	}
 	if status == http.StatusTooManyRequests {
+		return ErrSoftRate
+	}
+	for _, m := range hardMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrHardCredit
+		}
+	}
+	// 非 429 但 body 含限流文案（200+11140/400）→ 软限流
+	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "rate-limiting") ||
+		strings.Contains(lower, "too many requests") || strings.Contains(lower, "usage limit") ||
+		strings.Contains(lower, "请求过于频繁") || strings.Contains(lower, "限流") {
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {
@@ -68,6 +90,28 @@ func Classify(status int, body string) ErrKind {
 		return ErrServer
 	}
 	if status >= 400 {
+		// 专项分类在通用 4xx 之前：区分「请求问题」与「账号问题」。
+		if status == http.StatusBadRequest || status == http.StatusNotFound {
+			if strings.Contains(lower, "prompt is too long") || strings.Contains(lower, `"code":11115`) {
+				return ErrPromptTooLong
+			}
+			if strings.Contains(body, `"code":11101`) || strings.Contains(body, "Unmarshal chat params failed") {
+				return ErrClient // BadParams：不罚号但仍轮转
+			}
+		}
+		for _, m := range contentBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return ErrContentBlocked
+			}
+		}
+		// WAF 403：无业务信封的拦截形态
+		if status == http.StatusForbidden && !strings.Contains(body, `"code":`) && strings.TrimSpace(body) != "" {
+			return ErrWafBlock
+		}
+		// 账号级故障（11140/14017）
+		if strings.Contains(lower, "request illegal") || strings.Contains(lower, "trial not activated") {
+			return ErrAccountFault
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
@@ -99,13 +143,9 @@ type Client struct {
 	BillingBaseGlob string
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 加固：禁 h2 + Dial 超时/keepalive + TLS 握手超时 + ResponseHeaderTimeout。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:            &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		StreamHTTP:      &http.Client{Transport: tr},
@@ -123,6 +163,19 @@ func (c *Client) streamClient() *http.Client {
 		return c.StreamHTTP
 	}
 	return c.HTTP
+}
+
+func newTransport() *http.Transport {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
 }
 
 // billingClient 返回账单接口用的 HTTP 客户端。
@@ -261,6 +314,20 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo = provider.ModelInfo
 
+// catalogModel 目录接口的原始模型条目（含能力字段）。
+type catalogModel struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	MaxInputTokens  int64  `json:"maxInputTokens"`
+	MaxOutputTokens int64  `json:"maxOutputTokens"`
+	Disabled        bool   `json:"disabled"`
+	// 能力字段（上游目录返回）
+	SupportsImages     bool `json:"supportsImages"`
+	SupportsReasoning  bool `json:"supportsReasoning"`
+	SupportsToolCall   bool `json:"supportsToolCall"`
+	DisabledMultimodal bool `json:"disabledMultimodal"`
+}
+
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
@@ -269,7 +336,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
@@ -293,6 +360,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				MaxInputTokens  int64  `json:"maxInputTokens"`
 				MaxOutputTokens int64  `json:"maxOutputTokens"`
 				Disabled        bool   `json:"disabled"`
+				// 能力字段（国内版目录同样返回，实测可用）
+				SupportsImages     bool `json:"supportsImages"`
+				SupportsReasoning  bool `json:"supportsReasoning"`
+				SupportsToolCall   bool `json:"supportsToolCall"`
+				DisabledMultimodal bool `json:"disabledMultimodal"`
 			} `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
@@ -316,21 +388,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	dynMap := make(map[string]struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-	}, len(env.Data.Models))
+	dynMap := make(map[string]catalogModel, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled}
+		dynMap[m.ID] = m
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -344,6 +404,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ContextWindow:  m.MaxInputTokens,
 			ContextFromAPI: true, // 目录接口真实返回
 			MaxTokens:      m.MaxOutputTokens,
+			// 上游显式声明 supportsImages 且未被 disabledMultimodal 关闭
+			SupportsImages:    m.SupportsImages && !m.DisabledMultimodal,
+			SupportsReasoning: m.SupportsReasoning,
+			SupportsTools:     m.SupportsToolCall,
 		})
 	}
 	if len(out) == 0 {
@@ -354,64 +418,103 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
-	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	resp, err := c.getUserResource(a)
 	if err != nil {
 		return 0, err
-	}
-	BillingHeaders(req, a)
-	data, err := c.doJSONBilling(req)
-	if err != nil {
-		return 0, err
-	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
-		switch {
-		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
-		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
-		default:
-			r = acct.CapacityRemain
-		}
-		if r < 0 {
-			r = 0
-		}
-		remain += r
+		remain += acct.remain()
 	}
 	return remain, nil
 }
 
 // UserResourceDetail 查询账号积分明细（所有套餐条目）。
 func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
+	resp, err := c.getUserResource(a)
+	if err != nil {
+		return 0, nil, err
+	}
+	var total int64
+	items := make([]provider.ResourceItem, 0, len(resp.Response.Data.Accounts))
+	for _, acct := range resp.Response.Data.Accounts {
+		tot, used, remain := acct.bill()
+		total += remain
+		items = append(items, provider.ResourceItem{
+			Name:     acct.PackageName,
+			Total:    tot,
+			Used:     used,
+			Remain:   remain,
+			ExpireAt: acct.expireAt(),
+			Usable:   true, // 国内版无端点分区，所有套餐均可被本工具消耗
+		})
+	}
+	return total, items, nil
+}
+
+// softRateResetLoc 上游墙钟时间口径：固定按 UTC+8 解释。
+// 上游下发的 CycleEndTime 等时间串均为国内时区墙钟；用 time.Local 解析会在
+// 非 UTC+8 机器上把到期日算错一天。
+var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// resourceAccount get-user-resource 单套餐条目（UserResource 与 UserResourceDetail 共用）。
+type resourceAccount struct {
+	PackageName         string `json:"PackageName"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	// CycleEndTime 周期结束时间（"2006-01-02 15:04:05"，UTC+8 墙钟）。
+	// 上游不提供 PackageEndTime（R-A/R-B 实测两域 42 字段均无），到期判据即此字段。
+	CycleEndTime string `json:"CycleEndTime"`
+}
+
+// bill 按周期口径优先返回 (总额, 已用, 剩余)；剩余负值钳 0。
+func (r resourceAccount) bill() (tot, used, remain int64) {
+	switch {
+	case r.CycleCapacitySize > 0:
+		tot, used, remain = r.CycleCapacitySize, r.CycleCapacityUsed, r.CycleCapacityRemain
+	case r.CycleCapacityRemain > 0 || r.CycleCapacityUsed > 0:
+		tot, used, remain = r.CycleCapacityRemain+r.CycleCapacityUsed, r.CycleCapacityUsed, r.CycleCapacityRemain
+	default:
+		tot, used, remain = r.CapacitySize, r.CapacityUsed, r.CapacityRemain
+	}
+	if remain < 0 {
+		remain = 0
+	}
+	return tot, used, remain
+}
+
+// remain 单套餐剩余额度（bill 的 remain 分量）。
+func (r resourceAccount) remain() int64 {
+	_, _, remain := r.bill()
+	return remain
+}
+
+// expireAt 把 CycleEndTime 墙钟串转为 YYYY-MM-DD；缺失/不可解析时返回空串。
+func (r resourceAccount) expireAt() string {
+	ts := strings.TrimSpace(r.CycleEndTime)
+	if ts == "" {
+		return ""
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, softRateResetLoc); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return ""
+}
+
+// userResourceResp get-user-resource 响应信封。
+type userResourceResp struct {
+	Response struct {
+		Data struct {
+			Accounts []resourceAccount `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// getUserResource 发 get-user-resource 请求并解析响应（两个消费方共享请求体与解析）。
+func (c *Client) getUserResource(a *auth.Auth) (*userResourceResp, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
@@ -425,55 +528,18 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	BillingHeaders(req, a)
 	data, err := c.doJSONBilling(req)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
+	var resp userResourceResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, nil, fmt.Errorf("resource parse: %w", err)
+		return nil, fmt.Errorf("resource parse: %w", err)
 	}
-	var total int64
-	items := make([]provider.ResourceItem, 0, len(resp.Response.Data.Accounts))
-	for _, acct := range resp.Response.Data.Accounts {
-		var total_, used, remain int64
-		switch {
-		case acct.CycleCapacitySize > 0:
-			total_, used, remain = acct.CycleCapacitySize, acct.CycleCapacityUsed, acct.CycleCapacityRemain
-		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			total_, used, remain = acct.CycleCapacityRemain+acct.CycleCapacityUsed, acct.CycleCapacityUsed, acct.CycleCapacityRemain
-		default:
-			total_, used, remain = acct.CapacitySize, acct.CapacityUsed, acct.CapacityRemain
-		}
-		if remain < 0 {
-			remain = 0
-		}
-		total += remain
-		items = append(items, provider.ResourceItem{
-			Name:   acct.PackageName,
-			Total:  total_,
-			Used:   used,
-			Remain: remain,
-		})
-	}
-	return total, items, nil
+	return &resp, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
@@ -498,10 +564,10 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 func (c *Client) Classify(status int, body string) provider.ErrKind { return Classify(status, body) }
 
 // Stream 实现 provider.Upstream（WorkBuddy 上游已是 OpenAI SSE，直接透传）。
-func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error { return Stream(w, r) }
+func (c *Client) Stream(w http.ResponseWriter, r io.Reader, model string) error { return Stream(w, r) }
 
 // Aggregate 实现 provider.Upstream（WorkBuddy OpenAI SSE 聚合）。
-func (c *Client) Aggregate(r io.Reader) (map[string]any, error) { return Aggregate(r) }
+func (c *Client) Aggregate(r io.Reader, model string) (map[string]any, error) { return Aggregate(r) }
 
 // FetchModelPricing 从 /console/enterprises/personal/models 拉取模型积分倍率。
 // 返回全量模型定价（含 credits 字段），不受 cli agent 过滤限制。
@@ -511,7 +577,7 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)

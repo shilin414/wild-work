@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -16,9 +17,9 @@ func TestPickHighestCredits(t *testing.T) {
 	p.Add(a1)
 	p.Add(a2)
 	p.Add(a3)
-	p.SetCredits("u1", 100)
-	p.SetCredits("u2", 500)
-	p.SetCredits("u3", 300)
+	p.SetCreditDetail("u1", 100, 0)
+	p.SetCreditDetail("u2", 500, 0)
+	p.SetCreditDetail("u3", 300, 0)
 	got := p.Pick()
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
@@ -31,8 +32,8 @@ func TestPickSkipsCooling(t *testing.T) {
 	a2 := &auth.Auth{UID: "u2"}
 	p.Add(a1)
 	p.Add(a2)
-	p.SetCredits("u1", 100)
-	p.SetCredits("u2", 50)
+	p.SetCreditDetail("u1", 100, 0)
+	p.SetCreditDetail("u2", 50, 0)
 	p.Cooldown("u1", CoolHard, time.Hour, "test")
 	got := p.Pick()
 	if got == nil || got.UID != "u2" {
@@ -44,7 +45,7 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}
 	p.Add(a1)
-	p.SetCredits("u1", 100)
+	p.SetCreditDetail("u1", 100, 0)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
 	time.Sleep(5 * time.Millisecond)
 	got := p.Pick()
@@ -66,8 +67,8 @@ func TestPickExcluding(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 100)
-	p.SetCredits("u2", 50)
+	p.SetCreditDetail("u1", 100, 0)
+	p.SetCreditDetail("u2", 50, 0)
 	tried := map[string]bool{"u1": true}
 	got := p.PickExcluding(tried)
 	if got == nil || got.UID != "u2" {
@@ -117,10 +118,15 @@ func TestReenableIfCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
-	p.ReenableIfCredits("u1", 500)
+	p.ReenableIfCredits("u1", 500, 120)
 	got := p.Pick()
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("should reenable, pick=%+v", got)
+	}
+	// 不可消耗额度应被记录供面板展示，但不影响可消耗余额。
+	st, _ := p.Status("u1")
+	if st.Credits != 500 || st.UnusableCredits != 120 {
+		t.Errorf("credits=%d unusable=%d, want 500/120", st.Credits, st.UnusableCredits)
 	}
 }
 
@@ -128,7 +134,7 @@ func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
-	p.ReenableIfCredits("u1", 0)
+	p.ReenableIfCredits("u1", 0, 0)
 	if p.Pick() != nil {
 		t.Fatal("zero credits should stay cooling")
 	}
@@ -138,7 +144,7 @@ func TestReenableDoesNotTouchDisabled(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "session dead")
-	p.ReenableIfCredits("u1", 500)
+	p.ReenableIfCredits("u1", 500, 0)
 	if p.Pick() != nil {
 		t.Fatal("disabled must not auto-reenable")
 	}
@@ -176,7 +182,7 @@ func TestList(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 42)
+	p.SetCreditDetail("u1", 42, 0)
 	p.Cooldown("u2", CoolSoft, time.Minute, "429")
 	list := p.List()
 	if len(list) != 2 {
@@ -223,5 +229,59 @@ func TestRecordCheckinAndRemove(t *testing.T) {
 	p.Remove("u1")
 	if _, ok := p.Status("u1"); ok {
 		t.Error("account should be removed")
+	}
+}
+
+// TestLoadLegacyStateMarksCreditsStale v2.2.0 及之前的 state 文件无 version/unusable 字段，
+// 读入后必须置 creditsStale，避免面板把旧口径余额当真值（需删除 data 目录才能恢复的兼容缺陷）。
+// 自动刷新首刷成功（SetCreditDetail）后即清除标记。
+func TestLoadLegacyStateMarksCreditsStale(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state-traework.json")
+	legacy := `{"accounts":{"u1":{"credits":5320,"disabled":false}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("账号应存在")
+	}
+	if !st.CreditsStale {
+		t.Errorf("旧格式 state 读入后应标记 credits_stale: %+v", st)
+	}
+	if st.Credits != 5320 {
+		t.Errorf("credits=%d want 5320（旧值保留，仅标记不可信）", st.Credits)
+	}
+
+	// 首刷成功 → 标记清除，数字变为真实拆分
+	p.SetCreditDetail("u1", 2710, 2600)
+	st, _ = p.Status("u1")
+	if st.CreditsStale {
+		t.Error("SetCreditDetail 后不应再标记 stale")
+	}
+	if st.Credits != 2710 || st.UnusableCredits != 2600 {
+		t.Errorf("credits=%d unusable=%d want 2710/2600", st.Credits, st.UnusableCredits)
+	}
+}
+
+// TestLoadCurrentStateNotStale 新版格式（version>=2）读入后不标记 stale。
+func TestLoadCurrentStateNotStale(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state-traework.json")
+	cur := `{"version":2,"accounts":{"u1":{"credits":2710,"unusable":2600}}}`
+	if err := os.WriteFile(fp, []byte(cur), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	st, _ := p.Status("u1")
+	if st.CreditsStale {
+		t.Errorf("新版格式不应标记 stale: %+v", st)
+	}
+	if st.Credits != 2710 || st.UnusableCredits != 2600 {
+		t.Errorf("credits=%d unusable=%d want 2710/2600", st.Credits, st.UnusableCredits)
 	}
 }

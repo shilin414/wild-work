@@ -259,8 +259,9 @@ type CheckinResult struct {
 }
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
-// 冷却与停用中的账号同样参与：签到只领积分，不会解除停用
-// （pool.ReenableIfCredits 要求 !disabled）；失败的账号只记录日志，不影响后续账号。
+// 冷却与停用中的账号同样参与：停用仅影响 API 路由，签到/保活仍需执行；
+// 签到只领积分，不会解除停用（pool.ReenableIfCredits 要求 !disabled）；
+// 失败的账号只记录日志，不影响后续账号。
 func (s *Scheduler) RunCheckinNow() {
 	name := s.name()
 	if s.cfg.SkipCheckin {
@@ -280,7 +281,7 @@ func (s *Scheduler) RunCheckinNow() {
 	log.Printf("checkin batch done platform=%s total=%d ok=%d failed=%d", name, len(accounts), len(accounts)-failed, failed)
 }
 
-// CheckinAccount 单个账号立即签到（停用/冷却同样参与），返回该账号结果。
+// CheckinAccount 单个账号立即签到（停用/冷却同样参与，停用仅路由受限），返回该账号结果。
 func (s *Scheduler) CheckinAccount(uid string) (CheckinResult, error) {
 	if _, ok := s.cfg.Pool.Status(uid); !ok {
 		return CheckinResult{}, fmt.Errorf("unknown account %s", uid)
@@ -343,8 +344,17 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 			r.Msg = "活跃保活"
 		}
 	}
-	// 无论签到成败都查余额（已签到等业务错误下余额刷新仍有效）
-	remain, rerr := s.cfg.Upstream.UserResource(a)
+	// 无论签到成败都查余额（已签到等业务错误下余额刷新仍有效）。
+	// 用 Detail 而非 UserResource：一次请求同时拿到可消耗余额与不可消耗额度小计。
+	usable, items, rerr := s.cfg.Upstream.UserResourceDetail(a)
+	// 401 再刷一次：DailyCheckin 可能因业务错误（已签到/无活动）提前返回而没走到刷新分支，
+	// 此时本地 token 可能已失效，不重试就会把余额记成 0。
+	if rerr != nil && isSessionDead(rerr) {
+		log.Printf("checkin credits token invalid platform=%s uid=%s, refreshing and retrying", name, uid)
+		if err := s.refreshForCheckin(a, uid); err == nil {
+			usable, items, rerr = s.cfg.Upstream.UserResourceDetail(a)
+		}
+	}
 	if rerr != nil {
 		log.Printf("checkin credits failed platform=%s uid=%s err=%v", name, uid, rerr)
 		r.OK = false // 签到后的积分确认失败，整次操作向 GUI 报告失败
@@ -354,9 +364,10 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 			r.Msg += "；余额查询失败"
 		}
 	} else {
-		r.Remain, r.HasRemain = remain, true
-		log.Printf("checkin credits platform=%s uid=%s remain=%d", name, uid, remain)
-		s.cfg.Pool.ReenableIfCredits(uid, remain)
+		_, unusable := provider.Summarize(items)
+		r.Remain, r.HasRemain = usable, true
+		log.Printf("checkin credits platform=%s uid=%s remain=%d unusable=%d", name, uid, usable, unusable)
+		s.cfg.Pool.ReenableIfCredits(uid, usable, unusable)
 	}
 	return s.finishCheckin(uid, r)
 }
@@ -405,8 +416,8 @@ func isSessionDead(err error) bool {
 	return errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead
 }
 
-// RunKeepaliveNow 立即对所有账号刷新 token；停用的账号同样保活，
-// 否则它们的 token 会一路衰减到期。session 死亡的自动禁用。
+// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// 停用的账号同样保活（停用仅影响 API 路由，token 仍需刷新防衰减）。
 func (s *Scheduler) RunKeepaliveNow() {
 	name := s.name()
 	accounts := s.cfg.Pool.List()

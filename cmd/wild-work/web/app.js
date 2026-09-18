@@ -45,6 +45,8 @@ let state = null;
 // ---------- 数据加载 ----------
 async function loadState() {
   state = await api("/api/state");
+  // 账号数据已变（刷新/签到/增删），明细缓存随之失效，避免 tooltip 展示旧余额。
+  detailCache = {};
   render();
 }
 
@@ -68,12 +70,21 @@ async function refreshFees() {
 }
 
 // ---------- 积分明细 tooltip ----------
+// 明细条数可能很多（TraeWork 每个签到奖励都是独立条目，常见 30+），
+// 故分页展示：每页 DETAIL_PAGE_SIZE 条，页码状态存在 detailState 里，
+// 翻页不重新请求（detailCache 已缓存该账号的完整响应）。
+const DETAIL_PAGE_SIZE = 8;
 let detailTimer = null;
 let detailCache = {};
+// detailState 当前 tooltip 的展示状态：{uid, page}。
+let detailState = null;
 
 async function showCreditDetail(e, uid) {
   const el = e.currentTarget;
   if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+
+  // 切换到另一个账号时重置页码；同一账号重复 hover 保留原页码。
+  const page = (detailState && detailState.uid === uid) ? detailState.page : 0;
 
   let d = detailCache[uid];
   if (!d) {
@@ -84,12 +95,6 @@ async function showCreditDetail(e, uid) {
   }
   if (!d || !d.items || !d.items.length) return;
 
-  let html = `<table class="detail-table"><thead><tr><th>套餐</th><th>总额</th><th>已用</th><th>剩余</th></tr></thead><tbody>`;
-  for (const it of d.items) {
-    html += `<tr><td>${esc(it.name)}</td><td>${it.total}</td><td>${it.used}</td><td>${it.remain}</td></tr>`;
-  }
-  html += `</tbody></table>`;
-
   let tip = $("creditTip");
   if (!tip) {
     tip = document.createElement("div");
@@ -97,15 +102,78 @@ async function showCreditDetail(e, uid) {
     tip.className = "credit-tip";
     document.body.appendChild(tip);
   }
+
+  const rect = el.getBoundingClientRect();
+  detailState = { uid, page };
+  renderCreditDetail();
+  // 先渲染再量尺寸，才能决定向上还是向下弹出。
+  const h = tip.offsetHeight;
+  let top = rect.bottom + 4;
+  if (top + h > window.innerHeight) top = Math.max(4, rect.top - h - 4);
+  let left = rect.left;
+  if (left + tip.offsetWidth > window.innerWidth) left = Math.max(4, window.innerWidth - tip.offsetWidth - 10);
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+
+// renderCreditDetail 按 detailState 重绘 tooltip（含分页控件与可用/不可用小计）。
+function renderCreditDetail() {
+  const tip = $("creditTip");
+  if (!tip || !detailState) return;
+  const d = detailCache[detailState.uid];
+  if (!d || !d.items || !d.items.length) return;
+
+  const items = d.items;
+  const pages = Math.max(1, Math.ceil(items.length / DETAIL_PAGE_SIZE));
+  const page = Math.min(Math.max(0, detailState.page), pages - 1);
+  detailState.page = page;
+  const slice = items.slice(page * DETAIL_PAGE_SIZE, (page + 1) * DETAIL_PAGE_SIZE);
+
+  // 有效期列仅当上游确实下发了到期时间时才出现——渠道未返回则不显示该列，
+  // 避免一列全空或把「无到期信息」误读成「永不过期」。
+  const hasExpiry = items.some((it) => it.expire_at);
+
+  let html = `<div class="detail-head">积分明细 <span class="detail-count">共 ${items.length} 条</span></div>`;
+  html += `<table class="detail-table"><thead><tr><th>套餐</th><th>总额</th><th>已用</th><th>剩余</th>`;
+  if (hasExpiry) html += `<th>有效期</th>`;
+  html += `</tr></thead><tbody>`;
+  for (const it of slice) {
+    // 不可用额度整行淡显 + 角标，与可用额度区分开（如 TraeWork 的官方客户端专用池）。
+    const cls = it.usable ? "" : ' class="detail-unusable"';
+    const tag = it.usable ? "" : '<span class="detail-tag" title="该额度仅供官方客户端使用，本工具无法消耗">不可用</span>';
+    html += `<tr${cls}><td>${esc(it.name)}${tag}</td><td>${it.total}</td><td>${it.used}</td><td>${it.remain}</td>`;
+    if (hasExpiry) html += `<td>${it.expire_at ? esc(it.expire_at) : "-"}</td>`;
+    html += `</tr>`;
+  }
+  html += `</tbody></table>`;
+
+  // 小计行：只在确实存在不可用额度时才拆开展示，否则保持单数字（不制造无意义的 0）。
+  const usable = d.usable_remain || 0;
+  const unusable = d.unusable_remain || 0;
+  html += `<div class="detail-sum">`;
+  html += `<span>可用 <b>${usable}</b></span>`;
+  if (unusable > 0) html += `<span class="detail-sum-unusable">不可用 <b>${unusable}</b></span>`;
+  html += `</div>`;
+
+  if (pages > 1) {
+    html += `<div class="detail-pager">`;
+    html += `<span class="detail-pg${page === 0 ? " off" : ""}" data-pg="${page - 1}">‹</span>`;
+    html += `<span class="detail-pg-info">${page + 1} / ${pages}</span>`;
+    html += `<span class="detail-pg${page >= pages - 1 ? " off" : ""}" data-pg="${page + 1}">›</span>`;
+    html += `</div>`;
+  }
   tip.innerHTML = html;
   tip.style.display = "block";
 
-  const rect = el.getBoundingClientRect();
-  let left = rect.left, top = rect.bottom + 4;
-  if (top + 200 > window.innerHeight) top = rect.top - 200;
-  if (left + 280 > window.innerWidth) left = window.innerWidth - 290;
-  tip.style.left = left + "px";
-  tip.style.top = top + "px";
+  // 翻页：只改状态重绘，不重新请求接口。
+  tip.querySelectorAll(".detail-pg").forEach((btn) => {
+    if (btn.classList.contains("off")) return;
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const target = Number(btn.dataset.pg);
+      if (Number.isFinite(target)) { detailState.page = target; renderCreditDetail(); }
+    };
+  });
 }
 
 function hideCreditDetail() {
@@ -154,6 +222,20 @@ const noExplicitCheckin = (g) => NO_EXPLICIT_CHECKIN.has(g);
 const NO_CHECKIN_TAG = { workbuddyai: "自动领日活奖励" };
 const noCheckinText = (g) => NO_CHECKIN_TAG[g] || "无签到";
 
+// creditsText 账号卡片的积分文案。
+// 始终拆成「可用 / 不可用」两个数字：渠道（如 TraeWork）会下发官方客户端专用的
+// 额度池，对本工具是看得见用不了的，混进一个数字会让人误判可用余额。
+// 即使本账号当前没有专用池（不可用=0）也照样显示，与明细 tooltip 的小计口径一致。
+// 旧版本 state 文件（v2.2.0 及之前，无 unusable 字段）读入后 credits_stale=true，
+// 此时不把旧值当真值，改显示「待刷新」；自动刷新首刷成功后即变回真实拆分。
+function creditsText(a) {
+  if (a.credits_stale) {
+    return `<span class="credit-stale" title="余额口径已过期（旧版本状态文件），正在自动刷新…">待刷新</span>`;
+  }
+  return `<span class="credit-num">${a.credits}</span><span>可用积分</span>`
+       + `<span class="credit-sep">/</span><span class="credit-unusable">${a.unusable_credits || 0}</span><span>不可用</span>`;
+}
+
 function renderAccounts() {
   const grid = $("acctList");
   const empty = $("acctEmpty");
@@ -199,7 +281,7 @@ function renderAccounts() {
       </div>
       <div class="acct-uid">UID: ${esc(shortUid(a.uid))}</div>
       <div class="acct-mid">
-        <div class="acct-credits" onmouseenter="showCreditDetail(event,'${a.uid}')" onmouseleave="hideCreditDetail()">${a.credits}<span>积分</span></div>
+        <div class="acct-credits" onmouseenter="showCreditDetail(event,'${a.uid}')" onmouseleave="hideCreditDetail()">${creditsText(a)}</div>
         <div class="acct-checkin">${checkinTag}</div>
       </div>
     </div>`;
@@ -231,6 +313,38 @@ function renderFees(fees) {
 
   const UNKNOWN_TIP = "上游未返回，请在客户端自行确认";
 
+  // 能力图标：模型 ID 后的小标记，title 属性提供文字描述。
+  // 只展示上游明确声明的能力；未声明的（字段缺失或上游返回 false）不显示图标。
+  const capIcons = (m) => {
+    if (!m) return "";
+    const caps = [];
+    if (m.supports_images) {
+      caps.push(`<span class="cap-icon cap-img" title="支持图像输入（多模态视觉）：可直接发送图片给该模型">👁</span>`);
+    }
+    if (m.supports_reasoning) {
+      caps.push(`<span class="cap-icon cap-reason" title="支持思考/推理模式：回复前会进行推理（可能含 reasoning_content）">🧠</span>`);
+    }
+    if (m.supports_tools) {
+      caps.push(`<span class="cap-icon cap-tool" title="支持函数/工具调用（tool_calls）">🔧</span>`);
+    }
+    return caps.length > 0 ? ` <span class="cap-icons">${caps.join("")}</span>` : "";
+  };
+
+  // 能力文字摘要，拼进模型 tooltip。
+  // 措辞说明：上游模型列表接口未声明某能力时，本工具不自行断言其「不支持」，
+  // 只说「未声明」——避免把缺失信息当成否定结论。
+  const capText = (m) => {
+    if (!m) return null;
+    const yes = [], unknown = [];
+    (m.supports_images ? yes : unknown).push("图像输入");
+    (m.supports_reasoning ? yes : unknown).push("思考模式");
+    (m.supports_tools ? yes : unknown).push("工具调用");
+    const parts = [];
+    if (yes.length) parts.push(`支持：${yes.join("、")}`);
+    if (unknown.length) parts.push(`上游未声明：${unknown.join("、")}`);
+    return parts.join("；");
+  };
+
   // 模型 id 的 tooltip：能拿到上下文则展示，否则明确说未知
   const modelTip = (m) => {
     const parts = [`模型：${m.model}`];
@@ -242,6 +356,8 @@ function renderFees(fees) {
       parts.push("最大输出：未知");
       parts.push("（上游未提供该信息）");
     }
+    const ct = capText(m);
+    if (ct) parts.push(ct);
     return parts.join("\n");
   };
 
@@ -273,8 +389,8 @@ function renderFees(fees) {
     for (let i = 0; i < models.length; i += 2) {
       const m1 = models[i];
       const m2 = models[i + 1];
-      const id1 = m1 ? `<code title="${esc(modelTip(m1))}">${esc(m1.model)}</code>${noteCell(m1)}` : "";
-      const id2 = m2 ? `<code title="${esc(modelTip(m2))}">${esc(m2.model)}</code>${noteCell(m2)}` : "";
+      const id1 = m1 ? `<code title="${esc(modelTip(m1))}">${esc(m1.model)}</code>${capIcons(m1)}${noteCell(m1)}` : "";
+      const id2 = m2 ? `<code title="${esc(modelTip(m2))}">${esc(m2.model)}</code>${capIcons(m2)}${noteCell(m2)}` : "";
       html += `<tr><td>${id1}</td><td>${rateCell(m1)}</td><td>${id2}</td><td>${rateCell(m2)}</td></tr>`;
     }
   }
@@ -472,6 +588,15 @@ function openApiConfig() {
   } else {
     $("customHostRow").classList.add("hidden");
   }
+  // 模型路由
+  const cc = state.compat || {};
+  const channels = cc.channels || [];
+  $("selCh").innerHTML = channels.map(c => `<option value="${c}">${c}</option>`).join("");
+  $("selCh").value = cc.default_channel || (channels[0] || "");
+  $("inMaxTok").value = cc.max_tokens_cap || 0;
+  const map = cc.model_map || {};
+  const entries = Object.entries(map);
+  $("mapSummary").textContent = entries.length === 0 ? "（空）" : entries.map(([k,v]) => `${k} → ${v}`).join("\u00A0 \u00A0");
   $("apiConfigOverlay").classList.remove("hidden");
 }
 
@@ -485,7 +610,25 @@ async function saveApiConfig() {
   const port = parseInt($("inPort").value, 10);
   try {
     await api("/api/config/listen", { host, port });
-    toast("监听已切换");
+  } catch (e) { toast(e.message); return; }
+
+  const defaultChannel = $("selCh").value;
+  const maxTokensCap = parseInt($("inMaxTok").value, 10) || 0;
+  const raw = prompt("模型名映射（一行一条，格式：客户端名 = channel/model）\n支持通配：claude-* = workbuddy/glm-5.2",
+    Object.entries(state.compat?.model_map || {}).map(([k,v]) => `${k} = ${v}`).join("\n"));
+  if (raw === null) { closeApiConfig(); return; } // 用户取消
+  const modelMap = {};
+  for (const line of raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+    if (line.startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx < 0) { toast(`格式错误：${line}`); return; }
+    const k = line.substring(0, idx).trim(), v = line.substring(idx+1).trim();
+    if (!k || !v) { toast(`格式错误：${line}`); return; }
+    modelMap[k] = v;
+  }
+  try {
+    await api("/api/config/compat", { default_channel: defaultChannel, max_tokens_cap: maxTokensCap, model_map: modelMap });
+    toast("模型路由已更新");
     closeApiConfig();
     loadState();
   } catch (e) { toast(e.message); }

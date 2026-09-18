@@ -1,6 +1,8 @@
 // Package traework 封装 Trae SOLO 免费通道上游协议。
 package traework
 
+import "time"
+
 const (
 	AgentHost      = "https://trae-api-cn.mchost.guru"
 	UgHost         = "https://api.trae.cn"
@@ -27,3 +29,8 @@ const (
 )
 
 const DefaultConfigName = "glm-5.2"
+
+// softRateResetLoc 上游时间戳展示口径：固定按 UTC+8 墙钟解释。
+// 上游下发的 Unix 秒与官网展示的日期均以国内时区为准，用本地时区格式化会在
+// 非 UTC+8 机器上把到期日算错一天。
+var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)

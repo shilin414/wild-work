@@ -459,84 +459,94 @@ func checkinResponseMessage(message, msg string) string {
 	return strings.TrimSpace(msg)
 }
 
+// UserResource 查询账号当前可花费积分余额（= UserEntUsage 的可消耗口径，仅 ep=0 池）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) { return c.UserEntUsage(a) }
 
+// UserEntUsage 查询可消耗余额（pool 路由依据）。
+// 内部走 fetchEntUsage：只累加 available_endpoint==0 的包，ep=1 官方客户端专用池不计入。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
-	// 网页版 web_user_ent_usage：require_usage=true 返回每个包的 usage.credits_amount（实际用量），
-	// 剩余 = Σ(credits_limit - credits_amount)。
+	// 网页版 web_user_ent_usage：require_usage=true 返回每个包的 usage.credits_amount（实际用量）。
+	_, remain, err = c.fetchEntUsage(a)
+	return remain, err
+}
+
+// entPackage 上游权益包条目（UserEntUsage / UserResourceDetail 共用结构）。
+type entPackage struct {
+	EntitlementBaseInfo struct {
+		// AvailableEndpoint 可用端点：0=通用池（本工具走这里），1=官方客户端专用池（本工具用不了）。
+		AvailableEndpoint int `json:"available_endpoint"`
+		Quota             struct {
+			CreditsLimit float64 `json:"credits_limit"`
+		} `json:"quota"`
+		PackageName string `json:"package_name"`
+		PackageType string `json:"package_type"`
+	} `json:"entitlement_base_info"`
+	DisplayDesc string `json:"display_desc"`
+	GroupName   string `json:"group_name"`
+	GroupType   int    `json:"group_type"`
+	// ExpireTime 到期 Unix 秒；上游对无到期条目下发 0。
+	ExpireTime int64 `json:"expire_time"`
+	Usage      struct {
+		CreditsAmount float64 `json:"credits_amount"`
+	} `json:"usage"`
+}
+
+// fetchEntUsage 调用上游积分接口，返回全部条目 + 可消耗余额（仅 available_endpoint==0）。
+// 不可消耗余额由调用方对条目按 Usable 标记汇总（provider.Summarize），本函数不重复算。
+//
+// 可用性判据是 available_endpoint：实测（2026-09-18，三账号对比对话前后用量）
+// 本工具的 llm_utils_chat 只扣 ep=0 的包，ep=1（官方客户端专用池）分毫不动。
+// 早期实现用 group_type!=1 判定，会把 ep=1 的「用户福利」「签到奖励」误计入
+// 可消耗余额，导致 pool 按虚高余额选号。
+func (c *Client) fetchEntUsage(a *auth.Auth) ([]entPackage, int64, error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true}`)))
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	UgHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	var resp struct {
-		UserEntitlementPackList []struct {
-			EntitlementBaseInfo struct {
-				Quota struct {
-					CreditsLimit float64 `json:"credits_limit"`
-				} `json:"quota"`
-			} `json:"entitlement_base_info"`
-			Usage struct {
-				CreditsAmount float64 `json:"credits_amount"`
-			} `json:"usage"`
-		} `json:"user_entitlement_pack_list"`
+		UserEntitlementPackList []entPackage `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("ent usage parse: %w", err)
+		return nil, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
-	remainF := 0.0
+	var usable int64
 	for _, p := range resp.UserEntitlementPackList {
-		remainF += p.EntitlementBaseInfo.Quota.CreditsLimit - p.Usage.CreditsAmount
+		if p.EntitlementBaseInfo.AvailableEndpoint == 0 {
+			usable += packRemain(p)
+		}
 	}
-	return int64(remainF), nil
+	return resp.UserEntitlementPackList, usable, nil
+}
+
+// packRemain 单个权益包的剩余额度（limit - used，负值钳 0）。
+func packRemain(p entPackage) int64 {
+	limit := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+	used := int64(p.Usage.CreditsAmount)
+	if remain := limit - used; remain > 0 {
+		return remain
+	}
+	return 0
 }
 
 // UserResourceDetail 查询 TraeWork 积分明细（每个套餐条目）。
+// 返回的 remain 为可消耗余额（pool 路由依据），items 包含全部条目。
+// 每个条目带 expire_at（到期日）与 usable（是否属于本工具可消耗的 ep=0 池）。
 func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true}`)))
+	packs, usable, err := c.fetchEntUsage(a)
 	if err != nil {
 		return 0, nil, err
 	}
-	UgHeaders(req, a)
-	data, err := c.doJSON(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	var resp struct {
-		UserEntitlementPackList []struct {
-			EntitlementBaseInfo struct {
-				Quota struct {
-					CreditsLimit float64 `json:"credits_limit"`
-				}
-				PackageName string `json:"package_name"`
-				PackageType string `json:"package_type"`
-			} `json:"entitlement_base_info"`
-			DisplayDesc string `json:"display_desc"`
-			GroupName   string `json:"group_name"`
-			GroupType   int    `json:"group_type"`
-			Usage       struct {
-				CreditsAmount float64 `json:"credits_amount"`
-			} `json:"usage"`
-		} `json:"user_entitlement_pack_list"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, nil, fmt.Errorf("ent usage parse: %w", err)
-	}
-	var total int64
-	items := make([]provider.ResourceItem, 0, len(resp.UserEntitlementPackList))
-	for _, p := range resp.UserEntitlementPackList {
-		limit := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
-		used := int64(p.Usage.CreditsAmount)
-		remain := limit - used
-		if remain < 0 {
-			remain = 0
+	items := make([]provider.ResourceItem, 0, len(packs))
+	for _, p := range packs {
+		// 零额度条目（如免费的 0 限额包）不展示：既无信息量，又会把列表搅得很长。
+		if p.EntitlementBaseInfo.Quota.CreditsLimit <= 0 {
+			continue
 		}
-		total += remain
-		// 优先使用 group_name（如"每日签到"、"每月登录积分"），其次 display_desc，最后兜底
 		name := p.GroupName
 		if name == "" {
 			name = p.DisplayDesc
@@ -551,13 +561,23 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 			name = fmt.Sprintf("套餐 (group_type=%d)", p.GroupType)
 		}
 		items = append(items, provider.ResourceItem{
-			Name:   name,
-			Total:  limit,
-			Used:   used,
-			Remain: remain,
+			Name:     name,
+			Total:    int64(p.EntitlementBaseInfo.Quota.CreditsLimit),
+			Used:     int64(p.Usage.CreditsAmount),
+			Remain:   packRemain(p),
+			ExpireAt: unixDate(p.ExpireTime),
+			Usable:   p.EntitlementBaseInfo.AvailableEndpoint == 0,
 		})
 	}
-	return total, items, nil
+	return usable, items, nil
+}
+
+// unixDate 把上游 Unix 秒转为 UTC+8 的 YYYY-MM-DD；0/负值（上游未下发到期时间）返回空串。
+func unixDate(sec int64) string {
+	if sec <= 0 {
+		return ""
+	}
+	return time.Unix(sec, 0).In(softRateResetLoc).Format("2006-01-02")
 }
 
 func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, err error) {
@@ -591,8 +611,12 @@ func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, 
 }
 
 func (c *Client) Classify(status int, body string) provider.ErrKind { return Classify(status, body) }
-func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error   { return Stream(w, r) }
-func (c *Client) Aggregate(r io.Reader) (map[string]any, error)     { return Aggregate(r) }
+func (c *Client) Stream(w http.ResponseWriter, r io.Reader, model string) error {
+	return StreamWithModel(w, r, model)
+}
+func (c *Client) Aggregate(r io.Reader, model string) (map[string]any, error) {
+	return AggregateWithModel(r, model)
+}
 
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)

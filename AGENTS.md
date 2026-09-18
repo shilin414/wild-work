@@ -38,6 +38,9 @@ Wild-Work 是 WorkBuddy（国内版+国际版）/TraeWork/Qoder 多渠道账号�
 | R10 | 新增渠道扩展方式：实现 `provider.Upstream` 接口 + auth 加载器 + 注册 Runtime | 模型前缀 `channel/<model>` 路由；已实现 WorkBuddy(国内) + WorkBuddyAI(国际) + TraeWork + Qoder 四渠道 |
 | R11 | Windows 产物在 WSL 交叉编译（`GOOS=windows CGO_ENABLED=0`，已验证可行）；macOS 产物走 GitHub Actions macos-latest（cgo 必需） | WSL 无法编 darwin cgo；CI 增加 darwin job |
 | R12 | **无桌面 Linux 使用 `--no-tray` 参数** | 无参启动在无 DBus 环境托盘 panic 直接 exit 并提示；`--no-tray` 跳过托盘打印信息阻塞等待 Ctrl+C |
+| R13 | **三接口兼容采用两层结构：内层 handler 不动，新增 `internal/gateway` 边缘层**，经 **in-process 调用**（`io.Pipe` + ResponseWriter 形状）复用内层 | 代码量比内联重构多 20%，但改动面小一个数量级（主链路仅 2 处调用点 + 1 个访问器），回归风险低、可脱离 pool 单测。**不得用 HTTP 自环**（`0.0.0.0` 监听不可作目标、鉴权双份、启动竞态） |
+| R14 | **`Stream`/`Aggregate` 的 model 由调用方显式传入**，渠道不得用实例字段记忆「上次请求的模型名」 | 旧实现 qoder 用全局 `lastModel`，多账号并发会串号；traework 恒为空串。详见 `docs/三接口兼容改造备忘.md` §3 |
+| R15 | **Responses 的 `function_call` 必须是独立 output item**（带 `call_id`），Anthropic 的 tool_use 参数必须走 `input_json_delta` | 参考实现 `tokligence-gateway` 两处写法不合规范（塞进 `message.content`、start 里一次性给完整 input），Codex/Claude Code 会解析失败 |
 
 ## 2. 架构选型（依据）
 
@@ -127,6 +130,28 @@ POST /api/quit                     # 退出程序
 9. 定价缓存持久化到 `data/pricing-cache.json`，启动加载，超 1h 自动刷新
 10. 无桌面 Linux 必须 `--no-tray`，不带参数 panic 直接 exit 提示
 11. **粘性路由**：`pickWithSticky` 优先复用上次账号，直至连续成功请求达 50 次或遭遇错误冷却。成功时 `stickySuccess` 递增计数，错误时 `stickyClear` 清除粘性记录。不使用 credits 阈值（pool 中余额是 stale 数据）。
+12. **`internal/server` 主链路不得被绕过**：`POST /v1/chat/completions` 与 `GET /v1/models` 由内层直接服务，`internal/gateway` 只接管 `/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`。
+13. **兼容层调用内层只能经 `Gateway.call()`**（`io.Pipe`），调用方读完必须 `res.Close()`，否则内层 goroutine 可能阻塞在 Write 上泄漏。
+14. **`pipeRW.Flush()` 为空操作是刻意的**：`io.Pipe` 无缓冲，Write 即送达；不要改成缓冲 + 定时 flush。
+15. **错误分类 429 必须优先于 hardMarkers**：限流 body 高频带 `quota exceeded`，先判 hardRule 会把限流误归余额耗尽 → 12h 硬冷却。三渠道 `Classify` 均已修复此顺序。
+16. **脱敏层仅做文本替换不做语义变更**：`internal/sanitize` 只改模板句、不改用户内容语义；预检不命中时零分配原样通过。将来配置 `features.sanitize_fingerprints` 可一键关闭（逃生门）。
+17. **积分「可用/不可用」拆分统计**：`provider.ResourceItem.Usable` 标记条目是否属于本工具可消耗的额度池，`provider.Summarize()` 汇总小计。
+    - TraeWork 判据是 **`available_endpoint == 0`**（ep=1 是官方客户端专用池，本工具扣不到）；
+      **不得用 `group_type` 判定**——同名「每日签到」「用户福利」会同时存在 ep=0 与 ep=1 两份。
+      实测证据见 `docs/upstream-reverse-engineering.md` §2.3。
+    - `UserResource` / `UserResourceDetail` 返回的 remain **只能是可消耗余额**（ep=0），
+      否则 pool 会按虚高余额选号。含专用池的总量（`usage_summary.total_amount`）不能作路由依据。
+    - 不可消耗额度仅用于面板展示（`pool.Status.UnusableCredits`），不参与 `Pick()` 排序。
+18. **到期时间字段因渠道而异，缺失则不显示**：WorkBuddy 系是 `CycleEndTime`（**上游从不下发 `PackageEndTime`**，旧判据恒 miss），
+    TraeWork 是 `expire_time`（Unix 秒），Qoder 无此字段。均按 **UTC+8 墙钟**解析（`softRateResetLoc`），
+    用 `time.Local` 会在非 UTC+8 机器上算错一天。上游未下发时 `ResourceItem.ExpireAt` 必须为空串，
+    前端据此隐藏整列——**不得用零值时间冒充「永不过期」**。
+19. **401 必须自愈，不能只信本地 `expiresAt`**：上游刷新会作废旧 access token（refresh token 同步轮换）。若新 token 未落盘、
+    或同一账号在别处被刷新，本地文件里的 token `expiresAt` 仍在未来，但上游已拒绝 → `NeedsRefresh` 恒为假、永不刷新、
+    积分恒 0、明细恒空。因此积分/明细/费率路径遇 `ErrSessionDead` 必须「refresh + 落盘 + 重试一次」
+    （`app.refreshIfSessionDead`，scheduler 的 checkin 路径同理）。
+20. **凡是调 `Upstream.RefreshToken` 的地方必须紧跟 `SaveAtomic`**：refresh token 会轮换，不落盘 = 下次启动用旧 refresh token，
+    重回上一条的死锁（`RefreshPricing` 曾漏，已补）。
 
 ## 7. 平台能力差异表（internal/platform）
 
@@ -164,6 +189,18 @@ python -c "b=open('dist/wild-work.exe','rb').read(); print('new:',b.count(b'2.1.
 # 期望：new >= 1 且 old == 0。若旧版本号仍在，说明构建未生效。
 ```
 
+### 发版（tag 触发）
+
+push `v*` tag → GitHub Actions 构建五平台产物并创建正式 release。
+**release note 用仓库根目录的 `RELEASE-<tag>.md`（手写摘要，面向用户）**，
+而不是 `--generate-notes`（那只给 commit 链接列表）；文件缺失时回退自动生成，不阻塞发版。
+
+```bash
+# 发版前确认：版本常量已 bump（internal/app/app.go const Version）、
+# RELEASE-vX.Y.Z.md 已写好且与 tag 名一致、dist/wild-work.exe 已本地重建验证
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
 ## 9. 文档索引
 
 - [README.md](README.md) — 用户文档
@@ -172,3 +209,4 @@ python -c "b=open('dist/wild-work.exe','rb').read(); print('new:',b.count(b'2.1.
 - [docs/workbuddy国际版逆向分析备忘.md](docs/workbuddy国际版逆向分析备忘.md) — 国际版接口逆向（含抓包证据、模型倍率全表、凭据通用性验证）
 - [docs/workbuddy国际版渠道接入备忘.md](docs/workbuddy国际版渠道接入备忘.md) — 国际版渠道接入方案（接口规格、代码映射、调度设计、实施 Checklist）
 - [docs/upstream-reverse-engineering.md](docs/upstream-reverse-engineering.md) — 各上游渠道 API 逆向记录
+- [docs/三接口兼容改造备忘.md](docs/三接口兼容改造备忘.md) — 三接口（Chat/Responses/Anthropic）兼容层架构决策、实施记录、验证清单、已知限制

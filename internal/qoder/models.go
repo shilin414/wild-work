@@ -101,6 +101,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			ID:            name,
 			Name:          m.DisplayName,
 			ContextWindow: 180000,
+			// is_vl 即上游的视觉能力声明；is_reasoning 为思考模式。
+			SupportsImages:    m.IsVL,
+			SupportsReasoning: m.IsReasoning,
 		}
 		if m.MaxInputTokens > 0 {
 			mi.ContextWindow = m.MaxInputTokens

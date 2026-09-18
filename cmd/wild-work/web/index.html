@@ -143,6 +143,19 @@
       </div>
       <div id="customHostRow" class="row hidden"><input id="inHost" class="input grow" placeholder="如 192.168.1.100" spellcheck="false"></div>
       <div class="risk-tip">⚠️ 监听 0.0.0.0 时，局域网内任何设备都可访问本 API 与账号管理，风险请自行评估。</div>
+      <hr>
+      <div class="row" style="margin-top:8px"><label class="lbl">默认渠道</label>
+        <select id="selCh" class="select"></select>
+      </div>
+      <div class="row"><label class="lbl">封顶 tokens</label>
+        <input id="inMaxTok" class="input port" type="number" min="0" step="1000">
+        <span class="hint" style="margin-left:6px">0=不限制</span>
+      </div>
+      <div class="row" style="align-items:center">
+        <label class="lbl">映射表</label>
+        <span class="btn small" id="btnCompatMap">编辑</span>
+        <span class="hint" id="mapSummary" style="margin-left:6px"></span>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn small" id="btnApiCancel">取消</button>
@@ -172,11 +185,17 @@
     <div class="modal-body docs">
       <p>1. 添加账号后自动完成登录（WorkBuddy 国际版无需手动签到，定时自动领取日活奖励；Qoder 渠道无签到活动，仅 API 转发）。</p>
       <p>2. AI 客户端配置：Base URL <code>http://127.0.0.1:7863/v1</code>，API Key 见页面顶部。</p>
-      <p>3. 模型 ID 需带渠道前缀：<code>workbuddy/&lt;model&gt;</code>、<code>workbuddyai/&lt;model&gt;</code>、<code>traework/&lt;model&gt;</code>、<code>qoder/&lt;model&gt;</code>。</p>
-      <p>4. 积分会随聊天消耗实时变化，"全部刷新积分"可即时获取最新余额。</p>
-      <p>5. 日志文件位于 exe 目录下 <code>data/app.log</code>，可从托盘菜单"查看日志"打开。</p>
-      <p>6. 退出程序：右键托盘图标选择"退出"。</p>
-      <p>7. 本工具仅供个人学习使用，请遵守各上游平台服务条款。</p>
+      <p>3. 支持三种接口协议：<br>
+        · OpenAI Chat：<code>POST /v1/chat/completions</code>（旧版客户端）<br>
+        · OpenAI Responses：<code>POST /v1/responses</code>（codex CLI）<br>
+        · Anthropic Messages：<code>POST /v1/messages</code>（claude CLI，Base URL 不带 <code>/v1</code>）<br>
+        Anthropic 客户端用 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 均可。</p>
+      <p>4. 模型 ID 建议带渠道前缀：<code>workbuddy/&lt;model&gt;</code>、<code>workbuddyai/&lt;model&gt;</code>、<code>traework/&lt;model&gt;</code>、<code>qoder/&lt;model&gt;</code>；
+        也支持裸名（走 <code>config.json</code> 的 <code>compat.default_channel</code> / <code>model_map</code>）。</p>
+      <p>5. 积分会随聊天消耗实时变化，"全部刷新积分"可即时获取最新余额。</p>
+      <p>6. 日志文件位于 exe 目录下 <code>data/app.log</code>，可从托盘菜单"查看日志"打开。</p>
+      <p>7. 退出程序：右键托盘图标选择"退出"。</p>
+      <p>8. 本工具仅供个人学习使用，请遵守各上游平台服务条款。</p>
     </div>
     <div class="modal-actions">
       <button class="btn small primary" id="btnHelpClose">知道了</button>

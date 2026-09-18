@@ -344,10 +344,33 @@ x-machine-id: <机器 ID>
 - `0`: 免费订阅（含 enable_solo_agent 等能力）
 - `2`: 付费套餐/活动赠送
 
+**`available_endpoint`（可用端点，区分「本工具可用 / 不可用」的真实判据）**:
+
+| 值 | 含义 | 本工具（llm_utils_chat）能否消耗 |
+|----|------|--------------------------------|
+| 0 | 通用池 | ✅ 能（实测对话只扣 ep=0 的包） |
+| 1 | **官方客户端专用池** | ❌ 不能（对话前后该池用量分毫不动） |
+
+**铁证**（2026-09-18 实测，三账号各做一次 glm-5.2 对话后对比用量）：
+
+```
+账号 3066985700146732（对话前 → 对话后）
+  gt=1 ep=0 每日签到   used 420.7852 → 422.1424  (+1.3568)  ← 扣这里
+  gt=1 ep=1 每日签到   used   0.0000 →   0.0000  (不动)
+  gt=4 ep=1 用户福利   used   0.0000 →   0.0000  (不动)
+```
+
 **关键结论**:
-- **所有额度包都有 `no_bonus_quota: true`** → 无法区分"通用额度"和"Work 专属积分"
-- 上游未暴露 `package_type` 字段区分用途
-- 建议：按 `display_desc` 或 `group_name` 过滤特定类型（如只保留"签到奖励"）
+- **可用性判据是 `available_endpoint`，不是 `group_type`**。同名的「每日签到」
+  「用户福利」会同时存在 ep=0 与 ep=1 两份，只有 ep=0 那份能被本工具消耗。
+- 早期实现用 `group_type != 1` 判定可消耗余额，会把 ep=1 的「用户福利」「签到奖励」
+  误计入 → pool 按虚高余额选号。**已修正为 `available_endpoint == 0`**。
+- `usage_summary.total_amount` 是**含 ep=1 的总量**（如 5350），不是本工具可用余额
+  （该账号 ep=0 仅 2710）；不能用它做路由依据。
+- 明细的「总分与分项对不上」不是计算错误：分项合计（limit 与 used）与
+  `usage_summary` 严格自洽（实测 Σlimit=5350=total_amount、Σused=40.4864≈consumed_amount=40.49，
+  差额来自上游 `consumed_amount` 只保留两位小数）。真正的坑是**把含专用池的总量
+  当成了可用余额**，故界面上必须把可用/不可用拆开显示。
 
 ---
 
@@ -523,13 +546,22 @@ if resp.StatusCode >= 400 {
 ### 4.3 余额计算统一逻辑
 
 ```go
-remain = Σ(credits_limit - credits_amount) for all packs
+// TraeWork：只累加 available_endpoint == 0 的包（ep=1 官方客户端专用池不可用）
+remain = Σ(credits_limit - credits_amount) for packs where available_endpoint == 0
+
+// WorkBuddy / WorkBuddyAI：全部包可消耗，无端点分区
+remain = Σ(pack.remain) for all packs
+
+// Qoder
+remain = userQuota.remaining + addOnQuota.remaining
 ```
 
 **注意**:
-- TraeWork 每个 pack 有 `usage.credits_amount`（实际用量）
-- WorkBuddy 有 `CycleCapacityRemain`（周期剩余）优先取
-- Qoder 直接返回 `remaining`
+- TraeWork 每个 pack 有 `usage.credits_amount`（实际用量）与 `available_endpoint`（可用端点）
+- WorkBuddy 有 `CycleCapacityRemain`（周期剩余）优先取；到期时间为 `CycleEndTime`
+  （**不是** `PackageEndTime`，上游从不下发该字段），按 UTC+8 墙钟解析
+- Qoder 直接返回 `remaining`，无到期字段
+- **不可消耗额度必须与可消耗额度分开统计**，不得混进 pool 路由依据
 
 ### 4.4 错误透传原则
 
@@ -542,15 +574,11 @@ remain = Σ(credits_limit - credits_amount) for all packs
 
 ## 5. 待调研问题
 
-1. **TraeWork Work 专属积分**: 上游未暴露 `package_type` 字段，无法区分通用/专属额度
-   - 建议：按 `display_desc` 或 `group_name` 过滤特定类型
-   - 或联系上游获取更详细的额度分类
-
-2. **Qoder 推理开关**: 需确认上游是否支持 `reasoning_effort` / `thinking` 参数
+1. **Qoder 推理开关**: 需确认上游是否支持 `reasoning_effort` / `thinking` 参数
    - 当前实现：透传 `reasoning_effort` → `thinking`
    - 需验证上游兼容性
 
-3. **TraeWork 设备指纹**: `x-device-id` 必须与账号注册设备一致，否则 401
+2. **TraeWork 设备指纹**: `x-device-id` 必须与账号注册设备一致，否则 401
    - 首次登录自动绑定设备
    - 换设备需重新登录
 

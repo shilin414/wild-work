@@ -25,9 +25,67 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		finishReason  = "stop"
 		usage         map[string]any
 		gotAnyContent bool
+		validEvents   int
+		sawDone       bool
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
+		toolSeq       int
+		idIndex       = map[string]int{}
 	)
+	// appendContent 是「已取到正文」的唯一写入点：空串不置 latch，防止空 content 帧
+	// 阻塞后续 message 帧的合并（#142）。
+	appendContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		content.WriteString(txt)
+		gotAnyContent = true
+	}
+	// nextToolIndex 分配不冲突的缺 index 序号。
+	nextToolIndex := func() int {
+		for {
+			idx := toolSeq
+			toolSeq++
+			if _, used := toolCalls[idx]; !used {
+				return idx
+			}
+		}
+	}
+	mergeToolCallsChunk := func(tcs []any) {
+		for _, tc := range tcs {
+			call, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			idx := -1
+			if v, ok := call["index"].(float64); ok {
+				idx = int(v)
+			} else if cid, _ := call["id"].(string); cid != "" {
+				if mid, seen := idIndex[cid]; seen {
+					idx = mid
+				} else {
+					idx = nextToolIndex()
+				}
+			} else if len(toolOrder) > 0 {
+				idx = toolOrder[len(toolOrder)-1]
+			} else {
+				idx = nextToolIndex()
+			}
+			merged, seen := toolCalls[idx]
+			if !seen {
+				merged = map[string]any{"index": idx}
+				toolCalls[idx] = merged
+				toolOrder = append(toolOrder, idx)
+			}
+			if cid, _ := call["id"].(string); cid != "" {
+				idIndex[cid] = idx
+			}
+			if cid, _ := merged["id"].(string); cid != "" {
+				idIndex[cid] = idx
+			}
+			mergeToolCallDelta(merged, call)
+		}
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -37,10 +95,12 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if strings.HasPrefix(line, "data: ") {
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload == "[DONE]" {
-				// drain nothing; done
+				sawDone = true
+				break
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -67,36 +127,29 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
-									gotAnyContent = true
+									appendContent(txt)
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
-									for _, tc := range tcs {
-										call, ok := tc.(map[string]any)
-										if !ok {
-											continue
-										}
-										idx := 0
-										if v, ok := call["index"].(float64); ok {
-											idx = int(v)
-										}
-										merged, seen := toolCalls[idx]
-										if !seen {
-											merged = map[string]any{"index": idx}
-											toolCalls[idx] = merged
-											toolOrder = append(toolOrder, idx)
-										}
-										mergeToolCallDelta(merged, call)
-									}
+									mergeToolCallsChunk(tcs)
 								}
 							}
-							// 有的上游把完整消息放在 message 里（非 delta）
+							// 有的上游把完整消息放在 message 里（非 delta），
+							// 仅在 delta 未取过正文时并入（避免重复拼接）。
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
+								if r2, ok := msg["role"].(string); ok && r2 != "" {
+									role = r2
+								}
 								if txt, ok := msg["content"].(string); ok {
-									content.WriteString(txt)
+									appendContent(txt)
+								}
+								if rc, ok := msg["reasoning_content"].(string); ok {
+									reasoning.WriteString(rc)
+								}
+								if tcs, ok := msg["tool_calls"].([]any); ok {
+									mergeToolCallsChunk(tcs)
 								}
 							}
 						}
@@ -107,6 +160,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if err == io.EOF {
 			break
 		}
+	}
+	if validEvents == 0 {
+		return nil, fmt.Errorf("upstream stream contained no valid data events")
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -127,7 +183,12 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		for _, idx := range toolOrder {
 			calls = append(calls, toolCalls[idx])
 		}
-		message["tool_calls"] = calls
+		if finishReason == "length" || !sawDone {
+			calls = dropTruncatedToolCalls(calls)
+		}
+		if len(calls) > 0 {
+			message["tool_calls"] = calls
+		}
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -143,9 +204,56 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		},
 	}
 	if usage != nil {
-		resp["usage"] = usage
+		resp["usage"] = ensureUsageTotal(usage)
 	}
 	return resp, nil
+}
+
+// ensureUsageTotal 缺 total_tokens 时用 prompt+completion 合成补齐。
+func ensureUsageTotal(u map[string]any) map[string]any {
+	if _, ok := u["total_tokens"]; ok {
+		return u
+	}
+	pt, pok := num64(u["prompt_tokens"])
+	ct, cok := num64(u["completion_tokens"])
+	if !pok || !cok {
+		return u
+	}
+	out := make(map[string]any, len(u)+1)
+	for k, v := range u {
+		out[k] = v
+	}
+	out["total_tokens"] = pt + ct
+	return out
+}
+
+func num64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int64:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// dropTruncatedToolCalls 丢弃截断的 tool_call 残缺参数（EOF 或 length 截断）。
+func dropTruncatedToolCalls(calls []map[string]any) []map[string]any {
+	kept := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		fn, _ := call["function"].(map[string]any)
+		if fn == nil {
+			kept = append(kept, call)
+			continue
+		}
+		args, _ := fn["arguments"].(string)
+		if args == "" || json.Valid([]byte(args)) {
+			kept = append(kept, call)
+		}
+	}
+	return kept
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：

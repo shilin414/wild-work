@@ -23,7 +23,7 @@ internal/
 ├── pool/pool.go               # 账号池：余额挑号 + 冷却/禁用状态机 + state.json 持久化
 ├── scheduler/scheduler.go     # 定时签到 + token 保活 + 冷却解冻
 ├── provider/provider.go       # Upstream 接口 + 共享类型（ModelInfo/ModelPricing/ResourceItem）
-├── upstream/                   # WorkBuddy(CodeBuddy) 上游：chat/billing/auth/模型/定价
+├── upstream/                   # WorkBuddy(CodeBuddy) 上游：chat/billing/auth/模型/定价/脱敏
 ├── traework/                   # TraeWork 上游：chat(SOLO)/billing/checkin/模型/定价
 ├── qoder/                      # Qoder 上游：chat(COSY)/billing/模型/定价
 ├── login/                      # WorkBuddy OAuth 登录编排
@@ -32,7 +32,7 @@ internal/
 ├── auth/auth.go                # 凭证文件解析（嵌套/扁平双形态）+ 原子写回
 ├── config/config.go            # 配置加载/校验/写回（listen 新旧格式兼容）
 ├── systray/systray.go          # 跨平台托盘：固定菜单 + 纯 Go 生成图标
-└── platform/                   # 平台能力：浏览器/自启/消息框/日志（build tag 拆分）
+├── sanitize/                   # 出站请求体指纹脱敏：清除 Claude Code / Codex 模板句
 ```
 
 ## 2. 关键不变量（改了会出事）
@@ -46,6 +46,9 @@ internal/
 7. **`CGO_ENABLED=0`**：Windows 交叉编译必须用此标志（纯 Go 无 cgo 依赖）。
 8. **定价缓存持久化**：`data/pricing-cache.json`，启动时加载，超过 1 小时自动刷新。
 9. **上游错误透传**：HTTP ≥400 时直接透传原始响应体，不在 server 层包装，冷却状态机仍正常运转。
+10. **Classify 429 优先于 hardMarkers**：三渠道 `Classify` 均须先判 `status==429` 再扫余额关键词；顺序反置会导致 429 + "quota exceeded" 误判硬冷却 12h。
+11. **脱敏层预检零分配**：`internal/sanitize` 的 `hasFingerprint` 先走 `strings.Contains` 特征快速路径，普通请求不命中即原样返回，不做 JSON Unmarshal。
+12. **RefreshHeaders 直接读 RefreshToken**：该函数调用方已持有 `a.Lock()`，不能走 `a.RefreshTokenValue()`（会死锁）。其余 API 头用 `a.AccessTokenValue()` 锁快照。
 
 ## 3. 渠道上游接口
 
