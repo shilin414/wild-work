@@ -32,7 +32,7 @@ import (
 )
 
 // Version 版本号。
-const Version = "2.2.1"
+const Version = "2.2.2"
 
 const (
 	loginTimeout   = 5 * time.Minute
@@ -336,9 +336,10 @@ func (a *App) StartLoginFor(kind string) (string, error) {
 	case provider.WorkBuddyAI:
 		authURL, err = loginwbai.Start(a.loginClient, a.loginStateFP)
 	default:
-		authURL, err = login.Start(a.loginClient, a.loginStateFP)
+		ep := login.EndpointsForRegion(a.cfg.Region)
+		authURL, err = login.Start(a.loginClient, a.loginStateFP, ep)
 		if err == nil {
-			if resolved, rerr := login.ResolveAuthURL(a.loginClient, authURL); rerr == nil && resolved != "" {
+			if resolved, rerr := login.ResolveAuthURL(a.loginClient, authURL, ep); rerr == nil && resolved != "" {
 				authURL = resolved
 			}
 		}
@@ -412,18 +413,7 @@ func (a *App) pollLogin(ctx context.Context) {
 			}
 			continue
 		}
-		if a.loginKind == provider.WorkBuddyAI {
-			r, err := loginwbai.Poll(a.loginClient, a.loginStateFP)
-			if err == nil {
-				a.completeWbaiLogin(r)
-				return
-			}
-			if !errors.Is(err, loginwbai.ErrPending) {
-				log.Printf("workbuddyai login poll failed: %v", err)
-			}
-			continue
-		}
-		r, err := login.Poll(a.loginClient, a.loginStateFP)
+		r, err := login.Poll(a.loginClient, a.loginStateFP, login.EndpointsForRegion(a.cfg.Region))
 		if err == nil {
 			a.completeLogin(r)
 			return
